@@ -4,7 +4,7 @@ from pathlib import Path
 
 import typer
 import uvicorn
-from sqlalchemy import select
+from sqlalchemy import and_, func, select
 
 from newsbot.config import get_settings
 from newsbot.db import SessionFactory, engine
@@ -74,9 +74,24 @@ def sources_sync(path: Path = Path("config/sources.json")) -> None:
 def review_export(limit: int = 100, output: Path | None = None) -> None:
     async def run() -> None:
         async with SessionFactory() as session:
+            latest_versions = (
+                select(
+                    Draft.event_id,
+                    func.max(Draft.version).label("version"),
+                )
+                .group_by(Draft.event_id)
+                .subquery()
+            )
             rows = (
                 await session.execute(
                     select(Draft, Event)
+                    .join(
+                        latest_versions,
+                        and_(
+                            latest_versions.c.event_id == Draft.event_id,
+                            latest_versions.c.version == Draft.version,
+                        ),
+                    )
                     .join(Event, Event.id == Draft.event_id)
                     .order_by(Draft.created_at.desc())
                     .limit(min(max(limit, 1), 1000))
