@@ -8,7 +8,17 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from newsbot.config import Settings
-from newsbot.db_models import Article, Claim, Draft, Event, EventArticle, PublicationJob, Source
+from newsbot.db_models import (
+    Article,
+    Claim,
+    Draft,
+    Event,
+    EventArticle,
+    PublicationJob,
+    RawArticle,
+    Source,
+    as_utc,
+)
 from newsbot.fetcher import SourceFetcher
 from newsbot.llm import DeterministicLLM
 from newsbot.pipeline import Pipeline
@@ -156,6 +166,57 @@ async def test_changed_content_at_same_url_creates_revision_and_rechecks_event(
         assert articles[1].revision_of_id == articles[0].id
         assert await session.scalar(select(func.count(Event.id))) == 1
         assert await session.scalar(select(func.count(EventArticle.article_id))) == 2
+
+
+@pytest.mark.asyncio
+async def test_same_content_backfills_date_and_rechecks_event(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sessions.begin() as session:
+        source = Source(
+            name="official",
+            base_url="https://official.example",
+            kind=SourceKind.RSS,
+            feed_url="https://official.example/rss",
+            trust_level=1,
+            is_official=True,
+        )
+        session.add(source)
+        await session.flush()
+        source_id = source.id
+    settings = Settings(validate_public_source_ips=False)
+    pipeline = Pipeline(
+        sessions,
+        SourceFetcher(settings, httpx.AsyncClient()),
+        DeterministicLLM(),
+        settings,
+    )
+    base = {
+        "url": "https://official.example/news/1",
+        "title": "На улице Ленина отключат воду",
+        "text": "На улице Ленина отключат воду с 12:00 до 14:00.",
+        "raw_content": "<p>На улице Ленина отключат воду с 12:00 до 14:00.</p>".encode(),
+        "content_type": "text/html",
+    }
+
+    assert await pipeline._ingest(source_id, CandidateArticle(**base)) == (1, 1, 0)
+    result = await pipeline._ingest(
+        source_id,
+        CandidateArticle(
+            **base,
+            published_at=datetime(2026, 7, 28, 10, tzinfo=UTC),
+        ),
+    )
+
+    assert result == (0, 0, 1)
+    async with sessions() as session:
+        article = await session.scalar(select(Article))
+        event = await session.scalar(select(Event))
+        assert article and article.published_at
+        assert as_utc(article.published_at) == datetime(2026, 7, 28, 10, tzinfo=UTC)
+        assert event and event.event_time == article.published_at
+        assert await session.scalar(select(func.count(RawArticle.id))) == 1
+        assert await session.scalar(select(func.count(Draft.id))) == 1
 
 
 class HallucinatingLLM(DeterministicLLM):

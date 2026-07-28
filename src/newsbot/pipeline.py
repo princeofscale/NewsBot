@@ -197,7 +197,7 @@ class Pipeline:
 
     async def _ingest(self, source_id: UUID, candidate: CandidateArticle) -> tuple[int, int, int]:
         content_hash = text_hash(candidate.text)
-        async with self.sessions() as session:
+        async with self.sessions.begin() as session:
             existing = await session.scalar(
                 select(Article)
                 .where(
@@ -207,13 +207,33 @@ class Pipeline:
                 )
                 .order_by(Article.created_at.desc())
             )
-            if existing and existing.processing_state != ArticleState.PROCESSED:
-                event_id = await session.scalar(
+            event_id = (
+                await session.scalar(
                     select(EventArticle.event_id).where(EventArticle.article_id == existing.id)
                 )
+                if existing
+                else None
+            )
+            enriched = False
+            if existing and not existing.published_at and candidate.published_at:
+                existing.published_at = candidate.published_at
+                enriched = as_utc(candidate.published_at) >= utcnow() - timedelta(
+                    hours=self.settings.max_article_age_hours
+                )
+                if enriched and event_id:
+                    event = await session.get(Event, event_id)
+                    if event and not event.event_time:
+                        event.event_time = candidate.published_at
+            if existing and not existing.image_url and candidate.image_url:
+                existing.image_url = candidate.image_url
+            if existing and (existing.processing_state != ArticleState.PROCESSED or enriched):
+                existing.processing_state = ArticleState.NEW
                 existing_id = existing.id
             else:
+                existing_id = None
+            if not existing:
                 event_id = None
+            elif existing_id and not event_id:
                 existing_id = None
             previous = await session.scalar(
                 select(Article)
