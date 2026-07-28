@@ -1,6 +1,6 @@
 import json
 import re
-from typing import TypeVar
+from typing import Any, TypeVar, cast
 from uuid import UUID
 
 from openai import AsyncOpenAI
@@ -11,6 +11,17 @@ from newsbot.schemas import ClaimPayload, Post
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 NUMBER_RE = re.compile(r"\b\d+(?:[.,]\d+)?\b")
+
+
+def _message_content(response: object) -> str:
+    if isinstance(response, str):
+        framed = response.lstrip()
+        if framed.startswith("data:"):
+            framed = framed.removeprefix("data:").lstrip()
+        payload, _ = json.JSONDecoder().raw_decode(framed)
+        return str(payload["choices"][0]["message"]["content"] or "")
+    completion = cast(Any, response)
+    return str(completion.choices[0].message.content or "")
 
 
 class ClaimsResponse(BaseModel):
@@ -46,7 +57,7 @@ class OpenAICompatibleLLM:
                         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                     ],
                 )
-                return schema.model_validate_json(response.choices[0].message.content or "{}")
+                return schema.model_validate_json(_message_content(response) or "{}")
             except (ValueError, TypeError) as exc:
                 error = exc
         raise ValueError(f"LLM returned invalid structured response: {error}")
