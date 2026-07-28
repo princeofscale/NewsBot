@@ -56,7 +56,7 @@
       "text": "",
       "link": "",
       "article_date": ".news-item-date",
-      "article_text": ".news-detail, .detail-text, article"
+      "article_text": ".news-item-text"
     },
     "trust_level": 0.95,
     "is_official": true,

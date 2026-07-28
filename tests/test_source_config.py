@@ -14,6 +14,11 @@ def test_real_source_config_has_five_https_sources() -> None:
     assert len({source.name for source in sources}) == 5
     assert all(source.feed_url.scheme == "https" for source in sources)
     assert sum(source.is_official for source in sources) == 2
+    html_sources = [source for source in sources if source.kind == SourceKind.HTML]
+    assert all(source.selectors.get("article_date") for source in html_sources)
+    assert all(source.selectors.get("article_text") for source in html_sources)
+    administration = next(source for source in sources if source.name == "Администрация Саратова")
+    assert administration.selectors["article_text"] == ".news-item-text"
 
 
 @pytest.mark.asyncio
