@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 import structlog
-from sqlalchemy import exists, func, or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from newsbot.config import Settings
@@ -108,12 +108,13 @@ class Pipeline:
                 await self._record_failure(source.id, outcome)
                 continue
             result.fetched += len(outcome.articles)
+            result.errors += outcome.article_errors
             FETCHED.labels(source=source.name).inc(len(outcome.articles))
             try:
                 await self._record_success(source.id, outcome, result)
             except Exception as error:
                 result.errors += 1
-                await log.aexception(
+                await log.aerror(
                     "source_processing_failed",
                     source_id=str(source.id),
                     error=type(error).__name__,
@@ -148,6 +149,11 @@ class Pipeline:
                 finished_at=utcnow(),
                 status_code=outcome.status_code,
                 item_count=len(outcome.articles),
+                error=(
+                    f"{outcome.article_errors} article page(s) failed"
+                    if outcome.article_errors
+                    else None
+                ),
             )
             session.add(fetch)
             await session.flush()
@@ -159,7 +165,7 @@ class Pipeline:
             except Exception as error:
                 failures += 1
                 result.errors += 1
-                await log.aexception(
+                await log.aerror(
                     "article_processing_failed",
                     source_id=str(source_id),
                     url=candidate.url,
@@ -173,7 +179,15 @@ class Pipeline:
             source = await session.get(Source, source_id)
             stored_fetch = await session.get(SourceFetch, fetch_id)
             if stored_fetch and failures:
-                stored_fetch.error = f"{failures} article(s) failed processing"
+                stored_fetch.error = " ".join(
+                    filter(
+                        None,
+                        [
+                            stored_fetch.error,
+                            f"{failures} article(s) failed processing",
+                        ],
+                    )
+                )
             if source and not failures:
                 source.etag = outcome.etag
                 source.last_modified = outcome.last_modified
@@ -182,9 +196,16 @@ class Pipeline:
                 source.disabled_until = None
 
     async def _ingest(self, source_id: UUID, candidate: CandidateArticle) -> tuple[int, int, int]:
+        content_hash = text_hash(candidate.text)
         async with self.sessions() as session:
             existing = await session.scalar(
-                select(Article).where(Article.canonical_url == candidate.url)
+                select(Article)
+                .where(
+                    Article.source_id == source_id,
+                    Article.canonical_url == candidate.url,
+                    Article.content_hash == content_hash,
+                )
+                .order_by(Article.created_at.desc())
             )
             if existing and existing.processing_state != ArticleState.PROCESSED:
                 event_id = await session.scalar(
@@ -194,6 +215,23 @@ class Pipeline:
             else:
                 event_id = None
                 existing_id = None
+            previous = await session.scalar(
+                select(Article)
+                .where(
+                    Article.source_id == source_id,
+                    Article.canonical_url == candidate.url,
+                )
+                .order_by(Article.created_at.desc())
+                .limit(1)
+            )
+            previous_id = previous.id if previous and previous.id != existing_id else None
+            previous_event_id = (
+                await session.scalar(
+                    select(EventArticle.event_id).where(EventArticle.article_id == previous_id)
+                )
+                if previous_id
+                else None
+            )
         if existing_id and event_id:
             assert existing is not None
             try:
@@ -214,7 +252,7 @@ class Pipeline:
             return 0, 0, 0
 
         async with self.sessions.begin() as session:
-            raw_payload = candidate.raw_content.encode()
+            raw_payload = candidate.raw_content
             raw = RawArticle(
                 source_id=source_id,
                 canonical_url=candidate.url,
@@ -224,18 +262,18 @@ class Pipeline:
             )
             session.add(raw)
             await session.flush()
-            content_hash = text_hash(candidate.text)
             duplicate = await session.scalar(
                 select(Article.id).where(Article.content_hash == content_hash).limit(1)
             )
             stale = bool(
                 candidate.published_at
-                and candidate.published_at
+                and as_utc(candidate.published_at)
                 < utcnow() - timedelta(hours=self.settings.max_article_age_hours)
             )
             article = Article(
                 raw_article_id=raw.id,
                 source_id=source_id,
+                revision_of_id=previous_id,
                 canonical_url=candidate.url,
                 title=candidate.title,
                 text=candidate.text,
@@ -260,7 +298,10 @@ class Pipeline:
             if duplicate or stale:
                 return 1, 0, 0
 
-            event, similarity = await self._find_event(session, article)
+            event = await session.get(Event, previous_event_id) if previous_event_id else None
+            similarity = 1.0 if event else 0.0
+            if not event:
+                event, similarity = await self._find_event(session, article)
             event_created = 0
             if not event:
                 event = Event(
@@ -400,7 +441,11 @@ class Pipeline:
                     PublicationJob(
                         draft_id=draft.id,
                         platform=platform,
-                        operation=(JobOperation.EDIT if has_publications else JobOperation.PUBLISH),
+                        operation=(
+                            JobOperation.EDIT
+                            if has_publications and platform == Platform.TELEGRAM
+                            else JobOperation.PUBLISH
+                        ),
                     )
                     for platform in (Platform.TELEGRAM, Platform.MAX)
                 ]
@@ -411,9 +456,11 @@ class Pipeline:
     async def _find_event(
         self, session: AsyncSession, article: Article
     ) -> tuple[Event | None, float]:
-        events = (
-            await session.scalars(
-                select(Event)
+        fetched_rows = (
+            await session.execute(
+                select(Event, Article)
+                .join(EventArticle, EventArticle.event_id == Event.id)
+                .join(Article, Article.id == EventArticle.article_id)
                 .where(
                     Event.state.in_(
                         [
@@ -422,15 +469,26 @@ class Pipeline:
                             EventState.PUBLISHED,
                             EventState.UPDATED,
                         ]
-                    )
+                    ),
+                    Event.created_at
+                    >= utcnow() - timedelta(hours=self.settings.event_match_window_hours),
                 )
                 .order_by(Event.created_at.desc())
-                .limit(100)
+                .limit(200)
             )
         ).all()
         best: tuple[Event | None, float] = (None, 0.0)
-        for event in events:
-            score = event_similarity(article.title, event.title)
+        for event, representative in fetched_rows:
+            score = event_similarity(
+                article.title,
+                representative.title,
+                left_text=article.text,
+                right_text=representative.text,
+                left_time=as_utc(article.published_at) if article.published_at else None,
+                right_time=(
+                    as_utc(representative.published_at) if representative.published_at else None
+                ),
+            )
             if score > best[1]:
                 best = event, score
         return best
@@ -474,22 +532,45 @@ class Pipeline:
     async def _prepare_draft(
         self, session: AsyncSession, event: Event
     ) -> tuple[list[ClaimPayload], list[str], float] | None:
-        rows = (
+        fetched_rows = (
             await session.execute(
                 select(Article, Source)
                 .join(EventArticle, EventArticle.article_id == Article.id)
                 .join(Source, Source.id == Article.source_id)
-                .where(
-                    EventArticle.event_id == event.id,
-                    exists(
-                        select(Claim.id).where(
-                            Claim.source_article_id == Article.id,
-                            Claim.verified.is_(True),
-                        )
-                    ),
-                )
+                .where(EventArticle.event_id == event.id)
             )
         ).all()
+        latest: dict[tuple[UUID, str], tuple[Article, Source]] = {}
+        for article, source in fetched_rows:
+            key = (article.source_id, article.canonical_url)
+            current = latest.get(key)
+            if not current or article.created_at > current[0].created_at:
+                latest[key] = (article, source)
+        rows = list(latest.values())
+        article_ids = [article.id for article, _ in rows]
+        unverified = await session.scalar(
+            select(func.count(Claim.id)).where(
+                Claim.source_article_id.in_(article_ids),
+                Claim.verified.is_(False),
+            )
+        )
+        if unverified:
+            event.state = EventState.COLLECTING
+            event.decision_reason = "important claim values are not present in source text"
+            return None
+        verified_article_ids = set(
+            (
+                await session.scalars(
+                    select(Claim.source_article_id)
+                    .where(
+                        Claim.source_article_id.in_(article_ids),
+                        Claim.verified.is_(True),
+                    )
+                    .distinct()
+                )
+            ).all()
+        )
+        rows = [(article, source) for article, source in rows if article.id in verified_article_ids]
         dated = [article.published_at for article, _ in rows if article.published_at]
         if not dated:
             event.state = EventState.COLLECTING
@@ -524,23 +605,48 @@ class Pipeline:
             event.decision_reason = "awaiting an official or second independent source"
             return None
 
-        unverified = await session.scalar(
-            select(func.count(Claim.id)).where(
-                Claim.event_id == event.id, Claim.verified.is_(False)
-            )
-        )
-        if unverified:
-            event.state = EventState.COLLECTING
-            event.decision_reason = "important claim values are not present in source text"
-            return None
+        article_ids = [article.id for article, _ in rows]
         claims = [
             ClaimPayload.model_validate(item, from_attributes=True)
             for item in (
-                await session.scalars(select(Claim).where(Claim.event_id == event.id))
+                await session.scalars(select(Claim).where(Claim.source_article_id.in_(article_ids)))
             ).all()
         ]
+        if self._claims_conflict(claims):
+            event.state = EventState.COLLECTING
+            event.decision_reason = "independent source claims conflict"
+            return None
         urls = [article.canonical_url for article, _ in rows]
         return claims, urls, event.confidence
+
+    @staticmethod
+    def _claims_conflict(claims: list[ClaimPayload]) -> bool:
+        for index, left in enumerate(claims):
+            left_tokens = set(re.findall(r"\w{4,}", left.predicate.casefold()))
+            for right in claims[index + 1 :]:
+                if left.source_article_id == right.source_article_id:
+                    continue
+                right_tokens = set(re.findall(r"\w{4,}", right.predicate.casefold()))
+                overlap = left_tokens & right_tokens
+                if not overlap or len(overlap) / min(len(left_tokens), len(right_tokens)) < 0.5:
+                    continue
+                if left.numbers and right.numbers and set(left.numbers).isdisjoint(right.numbers):
+                    return True
+                if (
+                    left.event_time
+                    and right.event_time
+                    and abs(as_utc(left.event_time) - as_utc(right.event_time)) > timedelta(hours=1)
+                ):
+                    return True
+                if (
+                    left.location
+                    and right.location
+                    and set(map(str.casefold, left.location)).isdisjoint(
+                        map(str.casefold, right.location)
+                    )
+                ):
+                    return True
+        return False
 
     async def expire_old_events(self) -> None:
         async with self.sessions.begin() as session:
@@ -643,17 +749,14 @@ class PublicationWorker:
             post = _post_from_draft(draft)
             platform = job.platform
             operation = job.operation
-            publication = (
-                await session.scalar(
-                    select(PlatformPublication)
-                    .where(
-                        PlatformPublication.event_id == draft.event_id,
-                        PlatformPublication.platform == platform,
-                    )
-                    .limit(1)
+            publication = await session.scalar(
+                select(PlatformPublication)
+                .where(
+                    PlatformPublication.event_id == draft.event_id,
+                    PlatformPublication.platform == platform,
                 )
-                if operation == JobOperation.EDIT
-                else None
+                .order_by(PlatformPublication.published_at.desc())
+                .limit(1)
             )
             if operation == JobOperation.EDIT and not publication:
                 job.state = JobState.FAILED
@@ -669,6 +772,8 @@ class PublicationWorker:
                 )
                 result = None
             else:
+                if platform == Platform.MAX and publication:
+                    post = post.model_copy(update={"title": f"Обновление: {post.title}"[:240]})
                 result = await asyncio.wait_for(
                     self.publishers[platform].publish(post),
                     timeout=self.publish_timeout_seconds,
@@ -736,7 +841,7 @@ class PublicationWorker:
                 if event:
                     event.state = (
                         EventState.UPDATED
-                        if operation == JobOperation.EDIT
+                        if operation == JobOperation.EDIT or publication
                         else EventState.PUBLISHED
                     )
 

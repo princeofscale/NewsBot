@@ -1,12 +1,16 @@
 import asyncio
+import json
+from pathlib import Path
 
 import typer
 import uvicorn
+from sqlalchemy import select
 
 from newsbot.config import get_settings
 from newsbot.db import SessionFactory, engine
-from newsbot.db_models import Base
+from newsbot.db_models import Base, Draft, Event
 from newsbot.runtime import make_pipeline, make_worker, production_configuration_errors
+from newsbot.source_config import load_sources, sync_sources
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -45,6 +49,61 @@ def cycle() -> None:
         result = await pipeline.run_cycle()
         await pipeline.fetcher.close()
         typer.echo(result)
+
+    asyncio.run(run())
+
+
+@app.command("sources-sync")
+def sources_sync(path: Path = Path("config/sources.json")) -> None:
+    async def run() -> None:
+        async with SessionFactory() as session:
+            created, updated, disabled = await sync_sources(session, load_sources(path))
+        typer.echo(
+            {
+                "created": created,
+                "updated": updated,
+                "disabled": disabled,
+                "path": str(path),
+            }
+        )
+
+    asyncio.run(run())
+
+
+@app.command("review-export")
+def review_export(limit: int = 100, output: Path | None = None) -> None:
+    async def run() -> None:
+        async with SessionFactory() as session:
+            rows = (
+                await session.execute(
+                    select(Draft, Event)
+                    .join(Event, Event.id == Draft.event_id)
+                    .order_by(Draft.created_at.desc())
+                    .limit(min(max(limit, 1), 1000))
+                )
+            ).all()
+        payload = [
+            {
+                "event_id": str(event.id),
+                "event_state": event.state,
+                "decision_reason": event.decision_reason,
+                "draft_version": draft.version,
+                "validated": draft.validated,
+                "validation_reason": draft.validation_reason,
+                "confidence": draft.confidence,
+                "title": draft.title,
+                "body": draft.body,
+                "source_urls": draft.source_urls,
+                "created_at": draft.created_at.isoformat(),
+            }
+            for draft, event in rows
+        ]
+        rendered = json.dumps(payload, ensure_ascii=False, indent=2)
+        if output:
+            await asyncio.to_thread(output.write_text, rendered)
+            typer.echo({"exported": len(payload), "output": str(output)})
+        else:
+            typer.echo(rendered)
 
     asyncio.run(run())
 

@@ -8,7 +8,6 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_prefix="NEWSBOT_", extra="ignore")
 
     database_url: str = "sqlite+aiosqlite:///newsbot.db"
-    redis_url: str = "redis://localhost:6379/0"
     dry_run: bool = True
     log_level: str = "INFO"
     user_agent: str = "SaratovNewsBot/0.1 (+https://example.invalid/newsbot)"
@@ -21,6 +20,7 @@ class Settings(BaseSettings):
     circuit_cooldown_seconds: int = Field(default=1800, ge=60)
     collecting_ttl_hours: int = Field(default=24, ge=1)
     max_article_age_hours: int = Field(default=72, ge=1)
+    event_match_window_hours: int = Field(default=48, ge=1, le=168)
     publication_retry_base_seconds: int = Field(default=30, ge=1)
     sending_stale_seconds: int = Field(default=300, ge=30)
     worker_interval_seconds: int = Field(default=300, ge=10)
@@ -30,16 +30,17 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = "deepseek-v4-flash"
     llm_retries: int = Field(default=2, ge=1, le=4)
+    llm_retry_base_seconds: float = Field(default=0.5, ge=0, le=10)
     llm_timeout_seconds: float = Field(default=60, gt=0)
     publisher_timeout_seconds: float = Field(default=45, gt=0)
 
     telegram_api_id: int | None = None
     telegram_api_hash: str = ""
     telegram_session_string: str = ""
-    telegram_chat_id: str = "-1004308457179"
+    telegram_chat_id: str = ""
     max_token: str = ""
     max_password: str = ""
-    max_chat_id: int | None = -77353283215547
+    max_chat_id: int | None = None
 
 
 @lru_cache

@@ -5,12 +5,12 @@ from newsbot.db import SessionFactory
 from newsbot.runtime import make_pipeline, production_configuration_errors
 
 
-def test_cheapvibecode_and_target_chats_are_defaults() -> None:
+def test_cheapvibecode_is_default_but_target_chats_are_environment_only() -> None:
     settings = Settings(_env_file=None)
     assert settings.llm_base_url == "https://cheapvibecode.ru/v1"
     assert settings.llm_model == "deepseek-v4-flash"
-    assert settings.telegram_chat_id == "-1004308457179"
-    assert settings.max_chat_id == -77353283215547
+    assert settings.telegram_chat_id == ""
+    assert settings.max_chat_id is None
 
 
 def test_production_requires_real_llm_credentials() -> None:

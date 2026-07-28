@@ -6,10 +6,12 @@
 - PostgreSQL и SQLAlchemy 2.x — источник истины. Готовый draft и outbox-задания
   создаются одной транзакцией.
 - Источники хранятся в `sources`: RSS/HTML используют общую конфигурацию извлечения.
-- Оригинальный ответ сохраняется в `raw_articles`, очищенная версия — в `articles`.
-- Идемпотентность: уникальные canonical URL, content hash и outbox key.
-- Кластеризация сначала детерминированная (URL/hash/title/time); embeddings — сменный порт,
-  не LLM-only решение.
+- RSS/страница списка используются только для обнаружения URL. Полная HTML-страница
+  статьи сохраняется в `raw_articles`, очищенная версия — в `articles`.
+- Идемпотентность и ревизии: уникально сочетание source + canonical URL + content hash;
+  новый hash известного URL повторно проверяет прежнее событие.
+- Кластеризация детерминированно учитывает 48-часовое окно, действие, адрес, числа
+  и именованные сущности. Разные адреса не объединяются.
 - LLM — OpenAI-совместимый клиент со строгими Pydantic JSON-схемами. Провайдер/model
   задаются окружением.
 - `Publisher` изолирует Pyrofork и Pyromax. Dry-run реализует тот же интерфейс.
@@ -24,14 +26,12 @@
 ## Поток первого среза
 
 ```text
-RSS/HTML → conditional fetch → raw_articles → cleaned articles
-→ exact/title dedupe → event → claims/draft → validation → outbox → dry-run
+RSS/HTML → discovery → article page → raw_articles → cleaned article revision
+→ exact/context dedupe → event → claims/draft → validation → outbox → dry-run
 ```
 
 ## Следующее усиление
 
-- Redis/ARQ для распределённого расписания; текущий `newsbot worker` — один
-  последовательный автономный процесс.
 - embeddings и entity/action/location/time scorer для больших объёмов.
 - reconciliation `UNCERTAIN` через историю платформ.
 - production-метрики latency/error и alerting.

@@ -81,7 +81,14 @@ class SourceFetch(Base):
 
 class RawArticle(Base):
     __tablename__ = "raw_articles"
-    __table_args__ = (UniqueConstraint("source_id", "canonical_url", name="uq_raw_source_url"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "source_id",
+            "canonical_url",
+            "payload_hash",
+            name="uq_raw_source_url_payload",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     source_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("sources.id", ondelete="CASCADE"))
@@ -95,8 +102,14 @@ class RawArticle(Base):
 class Article(Base, TimestampMixin):
     __tablename__ = "articles"
     __table_args__ = (
-        UniqueConstraint("canonical_url", name="uq_article_url"),
+        UniqueConstraint(
+            "source_id",
+            "canonical_url",
+            "content_hash",
+            name="uq_article_source_url_content",
+        ),
         Index("ix_article_content_hash", "content_hash"),
+        Index("ix_article_source_url", "source_id", "canonical_url"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -104,6 +117,9 @@ class Article(Base, TimestampMixin):
         ForeignKey("raw_articles.id", ondelete="RESTRICT"), unique=True
     )
     source_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("sources.id", ondelete="RESTRICT"))
+    revision_of_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("articles.id", ondelete="SET NULL")
+    )
     canonical_url: Mapped[str] = mapped_column(String(1500))
     title: Mapped[str] = mapped_column(String(1000))
     text: Mapped[str] = mapped_column(Text)

@@ -1,10 +1,18 @@
+import asyncio
 import json
+import random
 import re
 from typing import Any, TypeVar, cast
 from uuid import UUID
 
-from openai import AsyncOpenAI
-from pydantic import BaseModel
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AsyncOpenAI,
+    InternalServerError,
+    RateLimitError,
+)
+from pydantic import BaseModel, Field
 
 from newsbot.config import Settings
 from newsbot.schemas import ClaimPayload, Post
@@ -30,7 +38,7 @@ class ClaimsResponse(BaseModel):
 
 class VerificationResponse(BaseModel):
     valid: bool
-    unsupported: list[str] = []
+    unsupported: list[str] = Field(default_factory=list)
 
 
 class OpenAICompatibleLLM:
@@ -46,7 +54,8 @@ class OpenAICompatibleLLM:
         self, system: str, payload: dict[str, object], schema: type[SchemaT]
     ) -> SchemaT:
         error: Exception | None = None
-        for _ in range(self.settings.llm_retries):
+        request_payload = {**payload, "json_schema": schema.model_json_schema()}
+        for attempt in range(self.settings.llm_retries):
             try:
                 response = await self.client.chat.completions.create(
                     model=self.settings.llm_model,
@@ -54,12 +63,32 @@ class OpenAICompatibleLLM:
                     temperature=0,
                     messages=[
                         {"role": "system", "content": system},
-                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                        {
+                            "role": "user",
+                            "content": json.dumps(request_payload, ensure_ascii=False),
+                        },
                     ],
                 )
-                return schema.model_validate_json(_message_content(response) or "{}")
-            except (ValueError, TypeError) as exc:
+                content = _message_content(response)
+                if not content.strip():
+                    raise ValueError("LLM returned an empty response")
+                return schema.model_validate_json(content)
+            except (
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+                AttributeError,
+                TimeoutError,
+                APITimeoutError,
+                APIConnectionError,
+                RateLimitError,
+                InternalServerError,
+            ) as exc:
                 error = exc
+                if attempt + 1 < self.settings.llm_retries:
+                    base = self.settings.llm_retry_base_seconds * 2**attempt
+                    await asyncio.sleep(base + random.uniform(0, base * 0.2))
         raise ValueError(f"LLM returned invalid structured response: {error}")
 
     async def extract_claims(self, article_id: UUID, title: str, text: str) -> list[ClaimPayload]:

@@ -11,6 +11,7 @@ from newsbot.pipeline import PublicationWorker
 from newsbot.publishers import DryRunPublisher
 from newsbot.schemas import (
     EventState,
+    JobOperation,
     JobState,
     Platform,
     Post,
@@ -101,6 +102,57 @@ async def test_update_existing_publications(
     )
     assert set((await worker.edit_event(event_id, post)).values()) == {"updated"}
     async with sessions() as session:
+        event = await session.get(Event, event_id)
+        assert event and event.state == EventState.UPDATED
+
+
+@pytest.mark.asyncio
+async def test_outbox_edits_telegram_and_publishes_prefixed_max_update(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    event_id = await seed_jobs(sessions)
+    telegram = DryRunPublisher(Platform.TELEGRAM)
+    max_publisher = DryRunPublisher(Platform.MAX)
+    worker = PublicationWorker(
+        sessions,
+        {Platform.TELEGRAM: telegram, Platform.MAX: max_publisher},
+        retry_base_seconds=0,
+    )
+    await worker.run_once()
+    async with sessions.begin() as session:
+        draft = Draft(
+            event_id=event_id,
+            title="Уточнено время",
+            body="Новый текст",
+            source_urls=["https://example.test/news"],
+            confidence=0.95,
+            validated=True,
+            version=2,
+        )
+        session.add(draft)
+        await session.flush()
+        session.add_all(
+            [
+                PublicationJob(
+                    draft_id=draft.id,
+                    platform=Platform.TELEGRAM,
+                    operation=JobOperation.EDIT,
+                ),
+                PublicationJob(
+                    draft_id=draft.id,
+                    platform=Platform.MAX,
+                    operation=JobOperation.PUBLISH,
+                ),
+            ]
+        )
+
+    await worker.run_once()
+
+    assert len(telegram.posts) == 1
+    assert len(max_publisher.posts) == 2
+    assert any(post.title.startswith("Обновление:") for post in max_publisher.posts.values())
+    async with sessions() as session:
+        assert await session.scalar(select(func.count(PlatformPublication.id))) == 3
         event = await session.get(Event, event_id)
         assert event and event.state == EventState.UPDATED
 

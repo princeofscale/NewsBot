@@ -9,3 +9,4 @@ __pycache__/
 *.session
 htmlcov/
 .coverage
+dry-run-review.json

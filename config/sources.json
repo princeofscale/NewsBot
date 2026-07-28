@@ -1,0 +1,84 @@
+[
+  {
+    "name": "СарБК",
+    "base_url": "https://news.sarbc.ru",
+    "kind": "RSS",
+    "feed_url": "https://www.sarbc.ru/rss/data-utf/main.rss",
+    "selectors": {
+      "article_text": "#news_text, .news-text, article"
+    },
+    "trust_level": 0.75,
+    "origin_group": "sarbc.ru",
+    "min_interval_seconds": 300
+  },
+  {
+    "name": "Взгляд-инфо",
+    "base_url": "https://www.vzsar.ru",
+    "kind": "HTML",
+    "feed_url": "https://www.vzsar.ru/",
+    "selectors": {
+      "item": "a[href^='/news/20']",
+      "title": "",
+      "text": "",
+      "link": "",
+      "article_date": ".newshead > p",
+      "article_text": ".news-content, .article-content, article"
+    },
+    "trust_level": 0.8,
+    "origin_group": "vzsar.ru",
+    "min_interval_seconds": 300
+  },
+  {
+    "name": "СарИнформ",
+    "base_url": "https://sarinform.ru",
+    "kind": "HTML",
+    "feed_url": "https://sarinform.ru/news",
+    "selectors": {
+      "item": ".rows > a[href^='/news/']",
+      "title": "",
+      "text": "",
+      "link": "",
+      "article_date": ".single-news__date",
+      "article_text": ".news-text, .article-text, article"
+    },
+    "trust_level": 0.7,
+    "origin_group": "sarinform.ru",
+    "min_interval_seconds": 300
+  },
+  {
+    "name": "Администрация Саратова",
+    "base_url": "https://www.saratovmer.ru",
+    "kind": "HTML",
+    "feed_url": "https://www.saratovmer.ru/news/",
+    "selectors": {
+      "item": "b > a[href^='/news/']",
+      "title": "",
+      "text": "",
+      "link": "",
+      "article_date": ".news-item-date",
+      "article_text": ".news-detail, .detail-text, article"
+    },
+    "trust_level": 0.95,
+    "is_official": true,
+    "origin_group": "saratovmer.ru",
+    "min_interval_seconds": 300
+  },
+  {
+    "name": "Регион 64",
+    "base_url": "https://sarnovosti.ru",
+    "kind": "HTML",
+    "feed_url": "https://sarnovosti.ru/news/",
+    "selectors": {
+      "item": ".news-block__body > a[href^='/news/']",
+      "title": "",
+      "text": "",
+      "link": "",
+      "article_date": "[itemprop='datePublished']",
+      "article_text": ".news-detail, .article-content, article"
+    },
+    "trust_level": 0.9,
+    "is_official": true,
+    "origin_group": "sarnovosti.ru",
+    "min_interval_seconds": 300
+  }
+]

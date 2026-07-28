@@ -1,5 +1,6 @@
 import asyncio
 import random
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -7,7 +8,7 @@ import httpx
 
 from newsbot.config import Settings
 from newsbot.db_models import Source, utcnow
-from newsbot.parsing import parse_source
+from newsbot.parsing import decode_payload, parse_article_page, parse_source
 from newsbot.schemas import CandidateArticle
 from newsbot.security import validate_public_url
 
@@ -18,6 +19,29 @@ class FetchResult:
     status_code: int
     etag: str | None = None
     last_modified: str | None = None
+    article_errors: int = 0
+
+
+Download = Callable[[str, dict[str, str]], Awaitable[tuple[httpx.Response, bytes]]]
+
+
+class ArticlePageFetcher:
+    def __init__(self, download: Download) -> None:
+        self.download = download
+
+    async def fetch(self, source: Source, discovered: CandidateArticle) -> CandidateArticle:
+        try:
+            response, payload = await self.download(discovered.url, {})
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code != 404 or discovered.url.endswith("/"):
+                raise
+            response, payload = await self.download(f"{discovered.url}/", {})
+        return parse_article_page(
+            payload,
+            response.headers.get("content-type", "text/html"),
+            discovered,
+            source.selectors or {},
+        )
 
 
 class SourceFetcher:
@@ -29,6 +53,7 @@ class SourceFetcher:
             follow_redirects=False,
         )
         self._semaphore = asyncio.Semaphore(settings.fetch_concurrency)
+        self.article_pages = ArticlePageFetcher(self._download)
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -49,16 +74,24 @@ class SourceFetcher:
                 response, payload = await self._download(source.feed_url, headers)
                 if response.status_code == 304:
                     return FetchResult([], 304, source.etag, source.last_modified)
+                discovered = parse_source(
+                    source.kind,
+                    decode_payload(payload, response.headers.get("content-type", "")),
+                    source.base_url,
+                    source.selectors or {},
+                )
+                discovered = list({article.url: article for article in discovered}.values())
+                pages = await asyncio.gather(
+                    *(self.article_pages.fetch(source, article) for article in discovered),
+                    return_exceptions=True,
+                )
+                articles = [page for page in pages if isinstance(page, CandidateArticle)]
                 return FetchResult(
-                    parse_source(
-                        source.kind,
-                        payload.decode(response.encoding or "utf-8", errors="replace"),
-                        source.base_url,
-                        source.selectors,
-                    ),
+                    articles,
                     response.status_code,
                     response.headers.get("etag"),
                     response.headers.get("last-modified"),
+                    sum(isinstance(page, BaseException) for page in pages),
                 )
             except (httpx.HTTPError, ValueError) as error:
                 last_error = error

@@ -71,7 +71,7 @@ class CandidateArticle(BaseModel):
     text: str
     published_at: datetime | None = None
     image_url: str | None = None
-    raw_content: str
+    raw_content: bytes
     content_type: str
 
 

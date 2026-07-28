@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from newsbot.config import Settings
-from newsbot.db_models import Article, Claim, Draft, Event, PublicationJob, Source
+from newsbot.db_models import Article, Claim, Draft, Event, EventArticle, PublicationJob, Source
 from newsbot.fetcher import SourceFetcher
 from newsbot.llm import DeterministicLLM
 from newsbot.pipeline import Pipeline
@@ -19,12 +19,20 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 def transport() -> httpx.MockTransport:
     rss = (FIXTURES / "source_a.xml").read_text()
-    html = (FIXTURES / "source_b.html").read_text()
+    listing = (FIXTURES / "source_b.html").read_text()
+    article_a = (FIXTURES / "article_a.html").read_text()
+    article_b = (FIXTURES / "article_b.html").read_text()
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.host == "a.example":
+        if request.url.path == "/rss":
             return httpx.Response(200, text=rss, headers={"etag": '"v1"'})
-        return httpx.Response(200, text=html)
+        if request.url.path == "/news":
+            return httpx.Response(200, text=listing)
+        return httpx.Response(
+            200,
+            text=article_a if request.url.host == "a.example" else article_b,
+            headers={"content-type": "text/html; charset=utf-8"},
+        )
 
     return httpx.MockTransport(handler)
 
@@ -97,6 +105,59 @@ async def test_vertical_slice_clusters_and_is_idempotent(
         assert await session.scalar(select(func.count(PublicationJob.id))) == 2
 
 
+@pytest.mark.asyncio
+async def test_changed_content_at_same_url_creates_revision_and_rechecks_event(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sessions.begin() as session:
+        source = Source(
+            name="official",
+            base_url="https://official.example",
+            kind=SourceKind.RSS,
+            feed_url="https://official.example/rss",
+            trust_level=1,
+            is_official=True,
+        )
+        session.add(source)
+        await session.flush()
+        source_id = source.id
+    settings = Settings(validate_public_source_ips=False)
+    pipeline = Pipeline(
+        sessions,
+        SourceFetcher(settings, httpx.AsyncClient()),
+        DeterministicLLM(),
+        settings,
+    )
+    base = {
+        "url": "https://official.example/news/1",
+        "title": "На улице Ленина отключат воду",
+        "published_at": datetime(2026, 7, 28, 10, tzinfo=UTC),
+        "content_type": "text/html",
+    }
+    await pipeline._ingest(
+        source_id,
+        CandidateArticle(
+            **base,
+            text="На улице Ленина отключат воду с 12:00 до 14:00.",
+            raw_content="<p>На улице Ленина отключат воду с 12:00 до 14:00.</p>".encode(),
+        ),
+    )
+    await pipeline._ingest(
+        source_id,
+        CandidateArticle(
+            **base,
+            text="На улице Ленина отключат воду с 13:00 до 15:00.",
+            raw_content="<p>На улице Ленина отключат воду с 13:00 до 15:00.</p>".encode(),
+        ),
+    )
+    async with sessions() as session:
+        articles = list((await session.scalars(select(Article).order_by(Article.created_at))).all())
+        assert len(articles) == 2
+        assert articles[1].revision_of_id == articles[0].id
+        assert await session.scalar(select(func.count(Event.id))) == 1
+        assert await session.scalar(select(func.count(EventArticle.article_id))) == 2
+
+
 class HallucinatingLLM(DeterministicLLM):
     async def extract_claims(self, article_id: UUID, title: str, text: str) -> list[ClaimPayload]:
         return [
@@ -108,6 +169,26 @@ class HallucinatingLLM(DeterministicLLM):
                 source_article_id=article_id,
             )
         ]
+
+
+def test_conflicting_numbers_from_independent_claims_are_rejected() -> None:
+    claims = [
+        ClaimPayload(
+            subject="МЧС",
+            predicate="сообщило о пострадавших",
+            claim="Пострадал 1 человек",
+            numbers=["1"],
+            source_article_id=uuid4(),
+        ),
+        ClaimPayload(
+            subject="МЧС",
+            predicate="сообщило о пострадавших",
+            claim="Пострадали 2 человека",
+            numbers=["2"],
+            source_article_id=uuid4(),
+        ),
+    ]
+    assert Pipeline._claims_conflict(claims)
 
 
 class FailsOnceLLM(DeterministicLLM):
