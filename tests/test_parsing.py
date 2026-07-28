@@ -17,6 +17,17 @@ from newsbot.schemas import CandidateArticle, SourceInput, SourceKind
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+def test_rss_item_without_summary_is_discovered() -> None:
+    articles = parse_feed(
+        "<rss><channel><item><title>Новость без анонса</title>"
+        "<link>https://example.test/news/1</link></item></channel></rss>",
+        "https://example.test",
+    )
+
+    assert len(articles) == 1
+    assert articles[0].text == "Новость без анонса"
+
+
 def test_rss_parser_and_canonical_url() -> None:
     articles = parse_feed((FIXTURES / "source_a.xml").read_text(), "https://a.example")
     assert len(articles) == 1
@@ -107,6 +118,10 @@ def test_event_match_requires_shared_action_context() -> None:
     assert not same_event(
         "ДТП произошло на Чернышевского",
         "ДТП произошло на Московской",
+    )
+    assert not same_event(
+        "Отключат воду на улице имени Академика Семенова, дом 12",
+        "Отключат воду на улице имени Академика Семенова, дом 14",
     )
 
 

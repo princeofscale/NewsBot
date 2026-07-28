@@ -1,6 +1,8 @@
 import asyncio
 import json
+import signal
 from pathlib import Path
+from uuid import UUID
 
 import typer
 import uvicorn
@@ -8,8 +10,17 @@ from sqlalchemy import and_, func, select
 
 from newsbot.config import get_settings
 from newsbot.db import SessionFactory, engine
-from newsbot.db_models import Base, Draft, Event
-from newsbot.runtime import make_pipeline, make_worker, production_configuration_errors
+from newsbot.db_models import AuditLog, Draft, Event
+from newsbot.dedupe_benchmark import evaluate
+from newsbot.fetcher import SourceFetcher
+from newsbot.pipeline import PublicationWorker
+from newsbot.runtime import (
+    close_clients,
+    make_pipeline,
+    make_worker,
+    production_configuration_errors,
+)
+from newsbot.source_check import check_sources
 from newsbot.source_config import load_sources, sync_sources
 
 app = typer.Typer(no_args_is_help=True)
@@ -32,23 +43,31 @@ def doctor() -> None:
     )
 
 
-@app.command("init-db")
-def init_db() -> None:
-    async def run() -> None:
-        async with engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
-        await engine.dispose()
-
-    asyncio.run(run())
-
-
 @app.command()
 def cycle() -> None:
     async def run() -> None:
         pipeline = make_pipeline(SessionFactory, get_settings())
-        result = await pipeline.run_cycle()
-        await pipeline.fetcher.close()
-        typer.echo(result)
+        try:
+            typer.echo(await pipeline.run_cycle())
+        finally:
+            await pipeline.close()
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+@app.command("sources-check")
+def sources_check() -> None:
+    async def run() -> None:
+        settings = get_settings()
+        fetcher = SourceFetcher(settings)
+        try:
+            results = await check_sources(SessionFactory, fetcher)
+            for result in results:
+                typer.echo(json.dumps(result.to_dict(), ensure_ascii=False, default=str))
+        finally:
+            await fetcher.close()
+            await engine.dispose()
 
     asyncio.run(run())
 
@@ -123,15 +142,83 @@ def review_export(limit: int = 100, output: Path | None = None) -> None:
     asyncio.run(run())
 
 
+@app.command("dedupe-evaluate")
+def dedupe_evaluate(path: Path) -> None:
+    typer.echo(evaluate(path))
+
+
+@app.command("cost-estimate")
+def cost_estimate(input_tokens: int, output_tokens: int) -> None:
+    settings = get_settings()
+    daily = (
+        input_tokens * settings.llm_input_usd_per_million
+        + output_tokens * settings.llm_output_usd_per_million
+    ) / 1_000_000
+    typer.echo({"daily_usd": round(daily, 4), "monthly_usd": round(daily * 30, 2)})
+
+
 @app.command()
 def publish() -> None:
     async def run() -> None:
         worker, clients = await make_worker(SessionFactory, get_settings())
-        typer.echo({"processed": await worker.run_once(), "dry_run": get_settings().dry_run})
-        for client in clients:
-            stop = getattr(client, "stop", None) or getattr(client, "close", None)
-            if stop:
-                await stop()
+        try:
+            typer.echo({"processed": await worker.run_once(), "dry_run": get_settings().dry_run})
+        finally:
+            await close_clients(clients)
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+@app.command()
+def reconcile() -> None:
+    async def run() -> None:
+        worker, clients = await make_worker(SessionFactory, get_settings())
+        try:
+            typer.echo(await worker.reconcile_uncertain())
+        finally:
+            await close_clients(clients)
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+@app.command("resolve-published")
+def resolve_published(job_id: UUID, external_id: str) -> None:
+    async def run() -> None:
+        worker = PublicationWorker(SessionFactory, {})
+        await worker.resolve_published(job_id, external_id)
+        async with SessionFactory.begin() as session:
+            session.add(
+                AuditLog(
+                    actor="cli",
+                    action="publication.resolve_published",
+                    target=str(job_id),
+                    details={"external_id": external_id},
+                )
+            )
+        await engine.dispose()
+        typer.echo({"job_id": str(job_id), "state": "PUBLISHED"})
+
+    asyncio.run(run())
+
+
+@app.command("resolve-retry")
+def resolve_retry(job_id: UUID) -> None:
+    async def run() -> None:
+        worker = PublicationWorker(SessionFactory, {})
+        await worker.resolve_retry(job_id)
+        async with SessionFactory.begin() as session:
+            session.add(
+                AuditLog(
+                    actor="cli",
+                    action="publication.resolve_retry",
+                    target=str(job_id),
+                    details={},
+                )
+            )
+        await engine.dispose()
+        typer.echo({"job_id": str(job_id), "state": "RETRY"})
 
     asyncio.run(run())
 
@@ -142,20 +229,30 @@ def worker() -> None:
         settings = get_settings()
         pipeline = make_pipeline(SessionFactory, settings)
         publication_worker, clients = await make_worker(SessionFactory, settings)
+        stopping = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(signum, stopping.set)
         try:
-            while True:
+            while not stopping.is_set():
                 try:
                     await pipeline.run_cycle()
+                    await publication_worker.reconcile_uncertain()
                     await publication_worker.run_once()
                 except Exception as error:
                     typer.echo(f"worker cycle failed: {type(error).__name__}", err=True)
-                await asyncio.sleep(settings.worker_interval_seconds)
+                try:
+                    await asyncio.wait_for(
+                        stopping.wait(), timeout=settings.worker_interval_seconds
+                    )
+                except TimeoutError:
+                    pass
         finally:
-            await pipeline.fetcher.close()
-            for client in clients:
-                stop = getattr(client, "stop", None) or getattr(client, "close", None)
-                if stop:
-                    await stop()
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                loop.remove_signal_handler(signum)
+            await pipeline.close()
+            await close_clients(clients)
+            await engine.dispose()
 
     asyncio.run(run())
 

@@ -7,6 +7,23 @@ on:
 jobs:
   checks:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: newsbot
+          POSTGRES_USER: newsbot
+          POSTGRES_PASSWORD: newsbot-ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U newsbot -d newsbot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      NEWSBOT_DATABASE_URL: postgresql+asyncpg://newsbot:newsbot-ci-only@127.0.0.1:5432/newsbot
+      NEWSBOT_TEST_DATABASE_URL: postgresql+asyncpg://newsbot:newsbot-ci-only@127.0.0.1:5432/newsbot_tests
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -15,7 +32,12 @@ jobs:
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
-      - run: uv sync --extra dev
+      - run: uv sync --frozen --extra dev
+      - run: createdb -h 127.0.0.1 -U newsbot newsbot_tests
+        env:
+          PGPASSWORD: newsbot-ci-only
+      - run: uv run alembic upgrade head
+      - run: uv run pytest -q tests/test_postgres_integration.py::test_alembic_schema_has_expected_constraints
       - run: uv run ruff check .
       - run: uv run mypy
       - run: uv run pytest

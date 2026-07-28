@@ -7,8 +7,8 @@ outbox → Telegram (Pyrofork) и MAX (Pyromax).
 
 ```bash
 cp .env.example .env
-docker compose up -d
-uv sync --extra dev
+docker compose up -d postgres
+uv sync --frozen --extra dev
 uv run alembic upgrade head
 uv run newsbot sources-sync
 uv run newsbot serve
@@ -18,6 +18,7 @@ API: `http://127.0.0.1:8000/docs`. Один цикл: `uv run newsbot cycle`.
 Отправка outbox: `uv run newsbot publish`. По умолчанию `NEWSBOT_DRY_RUN=true`.
 Автономный последовательный worker: `uv run newsbot worker`.
 Проверка готовности конфигурации без вывода секретов: `uv run newsbot doctor`.
+Проверка всех источников: `uv run newsbot sources-check`.
 
 Изменяющие состояние API-методы требуют
 `Authorization: Bearer $NEWSBOT_MANAGEMENT_TOKEN`; без токена management API отключён.
@@ -52,6 +53,15 @@ Pyromax 0.7.x пока не экспортирует поддерживаемы�
 обновление редактирует Telegram-пост, а в MAX создаёт новый пост с пометкой
 «Обновление:». Прямые запросы в обход Pyromax не используются.
 
+Неопределённые отправки Telegram сверяются по fingerprint командой
+`uv run newsbot reconcile`. Pyromax 0.7.x не предоставляет чтение истории,
+поэтому MAX разрешается явно:
+
+```bash
+uv run newsbot resolve-published JOB_UUID EXTERNAL_ID
+uv run newsbot resolve-retry JOB_UUID
+```
+
 Пять реальных источников находятся в `config/sources.json`. Сначала обнаруживается
 URL в RSS/списке, затем загружается и сохраняется полная страница статьи.
 
@@ -60,10 +70,14 @@ URL в RSS/списке, затем загружается и сохраняет
 
 ```bash
 uv run newsbot review-export --limit 100 --output dry-run-review.json
+uv run newsbot dedupe-evaluate tests/fixtures/dedupe_pairs.json
 ```
 
 `dry-run-review.json` содержит тексты, решения и ссылки на первоисточники; файл проверки
 не следует коммитить.
+
+Production-контейнер, kill switch, backup/restore и административные endpoints
+описаны в `docs/operations.md`. Полный статус готовности ведётся в `ROADMAP.md`.
 
 ## Проверки
 

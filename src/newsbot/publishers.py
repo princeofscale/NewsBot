@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from newsbot.formatters import format_max, format_telegram
+from newsbot.formatters import format_max, format_telegram, publication_fingerprint
 from newsbot.schemas import Platform, Post, PublicationResult
 
 
@@ -49,6 +49,13 @@ class TelegramPyroforkPublisher:
 
     async def delete(self, publication_id: str) -> None:
         await self.client.delete_messages(self.chat_id, int(publication_id))
+
+    async def find_publication(self, post: Post) -> str | None:
+        fingerprint = publication_fingerprint(post)
+        async for message in self.client.get_chat_history(self.chat_id, limit=100):
+            if fingerprint in (getattr(message, "text", None) or ""):
+                return str(message.id)
+        return None
 
 
 class MaxPyromaxPublisher:

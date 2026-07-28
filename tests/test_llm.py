@@ -3,9 +3,11 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
 from newsbot.config import Settings
 from newsbot.llm import OpenAICompatibleLLM, _message_content
+from newsbot.schemas import ClaimPayload
 
 
 def test_message_content_accepts_cheapvibecode_framing() -> None:
@@ -20,6 +22,19 @@ def test_message_content_accepts_openai_object() -> None:
         choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok":true}'))]
     )
     assert _message_content(response) == '{"ok":true}'
+
+
+def test_claim_schema_rejects_unknown_llm_fields() -> None:
+    with pytest.raises(ValidationError):
+        ClaimPayload.model_validate(
+            {
+                "subject": "Источник",
+                "predicate": "сообщил",
+                "claim": "Источник сообщил факт",
+                "source_article_id": str(uuid4()),
+                "invented": "must not be ignored",
+            }
+        )
 
 
 class FakeCompletions:

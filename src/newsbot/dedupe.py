@@ -14,7 +14,11 @@ ACTION_GROUPS = (
     {"обруш", "рухнул"},
 )
 STREET_RE = re.compile(
-    r"\b(?:улиц(?:а|е|ы|у|ей)?|ул\.)\s+([А-ЯЁ][А-Яа-яЁё-]+)"
+    r"\b(?:улиц(?:а|е|ы|у|ей)?|ул\.|проспект(?:е|а|у|ом)?|пр-т|"
+    r"переул(?:ок|ке|ка|ку|ком)?|шоссе|площад(?:ь|и))\s+"
+    r"([А-Яа-яЁё0-9][А-Яа-яЁё0-9.-]*(?:\s+[А-Яа-яЁё0-9][А-Яа-яЁё0-9.-]*){0,2}?)"
+    r"(?:\s*,?\s*(?:дом|д\.)\s*№?\s*(\d+[А-Яа-я]?)(?:[/к]\s*(\d+))?)?"
+    r"(?=\s*(?:[.;:]|$))"
     r"|\b(?:на|по)\s+([А-ЯЁ][а-яё-]{4,}(?:ского|цкого|ской|цкой|ова|ева|ина)?)"
 )
 ENTITY_RE = re.compile(r"\b[А-ЯЁ][а-яё-]{2,}(?:\s+[А-ЯЁ][а-яё-]{2,}){0,2}\b")
@@ -29,11 +33,19 @@ def title_similarity(left: str, right: str) -> float:
     return SequenceMatcher(None, normalize_title(left), normalize_title(right)).ratio()
 
 
-def _addresses(value: str) -> set[str]:
-    return {
-        next(part for part in match.groups() if part).casefold()
-        for match in STREET_RE.finditer(value)
-    }
+def extract_addresses(value: str) -> set[str]:
+    addresses = set()
+    for match in STREET_RE.finditer(value):
+        street, house, building, inferred = match.groups()
+        if inferred:
+            addresses.add(inferred.casefold())
+        elif street:
+            addresses.add(
+                " ".join(
+                    part.casefold() for part in (street, house, building) if part
+                )
+            )
+    return addresses
 
 
 def _actions(value: str) -> set[int]:
@@ -45,7 +57,7 @@ def _actions(value: str) -> set[int]:
     }
 
 
-def _entities(value: str) -> set[str]:
+def extract_entities(value: str) -> set[str]:
     return {match.group().casefold() for match in ENTITY_RE.finditer(value)}
 
 
@@ -64,8 +76,8 @@ def event_similarity(
 
     left_context = f"{left} {left_text[:500]}"
     right_context = f"{right} {right_text[:500]}"
-    left_addresses = _addresses(left_context)
-    right_addresses = _addresses(right_context)
+    left_addresses = extract_addresses(left_context)
+    right_addresses = extract_addresses(right_context)
     if left_addresses and right_addresses and left_addresses.isdisjoint(right_addresses):
         return 0.0
 
@@ -89,8 +101,8 @@ def event_similarity(
         if left_numbers and right_numbers
         else 0.0
     )
-    left_entities = _entities(left_context)
-    right_entities = _entities(right_context)
+    left_entities = extract_entities(left_context)
+    right_entities = extract_entities(right_context)
     entity_score = (
         len(left_entities & right_entities) / len(left_entities | right_entities)
         if left_entities or right_entities

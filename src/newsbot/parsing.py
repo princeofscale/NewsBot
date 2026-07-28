@@ -108,13 +108,14 @@ def parse_feed(payload: str, base_url: str) -> list[CandidateArticle]:
     for entry in feed.entries:
         content = entry.get("content") or []
         body = content[0].get("value", "") if content else entry.get("summary", "")
-        text = clean_text(body)
+        title = clean_text(entry.get("title", ""))
+        text = clean_text(body) or title
         link = canonicalize_url(urljoin(base_url, entry.get("link", "")))
-        if link and entry.get("title") and text:
+        if link and title:
             result.append(
                 CandidateArticle(
                     url=link,
-                    title=clean_text(entry.title),
+                    title=title,
                     text=text,
                     published_at=parse_datetime(entry.get("published") or entry.get("updated")),
                     image_url=(

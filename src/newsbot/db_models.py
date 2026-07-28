@@ -23,6 +23,7 @@ from newsbot.schemas import (
     JobOperation,
     JobState,
     Platform,
+    SourceHealth,
     SourceKind,
 )
 
@@ -63,6 +64,12 @@ class Source(Base, TimestampMixin):
     etag: Mapped[str | None] = mapped_column(String(500))
     last_modified: Mapped[str | None] = mapped_column(String(500))
     last_fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    health_state: Mapped[SourceHealth] = mapped_column(
+        String(20), default=SourceHealth.HEALTHY
+    )
+    last_error: Mapped[str | None] = mapped_column(Text)
     consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
     disabled_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -76,6 +83,9 @@ class SourceFetch(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status_code: Mapped[int | None]
     item_count: Mapped[int] = mapped_column(default=0)
+    loaded_count: Mapped[int] = mapped_column(default=0)
+    extraction_success_rate: Mapped[float] = mapped_column(Float, default=0)
+    diagnostics: Mapped[list[str]] = mapped_column(JSON, default=list)
     error: Mapped[str | None] = mapped_column(Text)
 
 
@@ -128,6 +138,8 @@ class Article(Base, TimestampMixin):
     image_url: Mapped[str | None] = mapped_column(String(1500))
     rejected_reason: Mapped[str | None] = mapped_column(Text)
     processing_state: Mapped[ArticleState] = mapped_column(String(20), default=ArticleState.NEW)
+    processing_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_processing_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Event(Base, TimestampMixin):
@@ -140,6 +152,8 @@ class Event(Base, TimestampMixin):
     decision_reason: Mapped[str] = mapped_column(Text, default="awaiting verification")
     event_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    requires_manual_review: Mapped[bool] = mapped_column(Boolean, default=False)
+    manually_approved: Mapped[bool] = mapped_column(Boolean, default=False)
     articles: Mapped[list["EventArticle"]] = relationship(back_populates="event")
 
 
@@ -177,6 +191,9 @@ class Claim(Base):
 
 class Draft(Base, TimestampMixin):
     __tablename__ = "drafts"
+    __table_args__ = (
+        UniqueConstraint("event_id", "version", name="uq_draft_event_version"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     event_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("events.id", ondelete="CASCADE"))
@@ -216,4 +233,25 @@ class PlatformPublication(Base):
     external_id: Mapped[str] = mapped_column(String(500))
     published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class RuntimeControl(Base, TimestampMixin):
+    __tablename__ = "runtime_control"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    publication_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    telegram_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    max_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    actor: Mapped[str] = mapped_column(String(200))
+    action: Mapped[str] = mapped_column(String(200))
+    target: Mapped[str] = mapped_column(String(500))
+    details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

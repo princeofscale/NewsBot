@@ -1,14 +1,24 @@
 from datetime import datetime
 from enum import StrEnum
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 from uuid import UUID
 
-from pydantic import BaseModel, Field, HttpUrl, model_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 
 class SourceKind(StrEnum):
     RSS = "RSS"
     HTML = "HTML"
+
+
+class SourceHealth(StrEnum):
+    HEALTHY = "HEALTHY"
+    DEGRADED = "DEGRADED"
+    UNAVAILABLE = "UNAVAILABLE"
 
 
 class EventState(StrEnum):
@@ -27,6 +37,7 @@ class JobState(StrEnum):
     PUBLISHED = "PUBLISHED"
     CANCELLED = "CANCELLED"
     FAILED = "FAILED"
+    DEAD_LETTER = "DEAD_LETTER"
     UNCERTAIN = "UNCERTAIN"
 
 
@@ -46,7 +57,7 @@ class Platform(StrEnum):
     MAX = "max"
 
 
-class SourceInput(BaseModel):
+class SourceInput(StrictModel):
     name: str
     base_url: HttpUrl
     kind: SourceKind
@@ -66,7 +77,7 @@ class SourceInput(BaseModel):
         return self
 
 
-class CandidateArticle(BaseModel):
+class CandidateArticle(StrictModel):
     url: str
     title: str
     text: str
@@ -76,7 +87,7 @@ class CandidateArticle(BaseModel):
     content_type: str
 
 
-class ClaimPayload(BaseModel):
+class ClaimPayload(StrictModel):
     subject: str = Field(min_length=1)
     predicate: str = Field(min_length=1)
     location: list[str] = Field(default_factory=list)
@@ -87,7 +98,7 @@ class ClaimPayload(BaseModel):
     source_article_id: UUID
 
 
-class Post(BaseModel):
+class Post(StrictModel):
     title: str = Field(max_length=240)
     body: str
     source_urls: list[str] = Field(min_length=1, max_length=3)
@@ -99,7 +110,7 @@ class Post(BaseModel):
         return len(self.title) + len(self.body) + sum(map(len, self.source_urls))
 
 
-class PublicationResult(BaseModel):
+class PublicationResult(StrictModel):
     publication_id: str
     platform: Platform
     published_at: datetime
@@ -111,6 +122,11 @@ class Publisher(Protocol):
     async def edit(self, publication_id: str, post: Post) -> None: ...
 
     async def delete(self, publication_id: str) -> None: ...
+
+
+@runtime_checkable
+class PublicationFinder(Protocol):
+    async def find_publication(self, post: Post) -> str | None: ...
 
 
 class LLMPort(Protocol):

@@ -1,6 +1,6 @@
 from uuid import uuid4
 
-from newsbot.formatters import format_max, format_telegram
+from newsbot.formatters import format_max, format_telegram, publication_fingerprint
 from newsbot.schemas import Post
 
 
@@ -17,3 +17,8 @@ def test_platform_formatters_escape_and_differ() -> None:
     assert "&lt;Событие&gt;" in telegram
     assert "<Событие>" in max_text
     assert telegram != max_text
+    assert publication_fingerprint(post) in telegram
+    assert publication_fingerprint(post) in max_text
+    assert publication_fingerprint(post) != publication_fingerprint(
+        post.model_copy(update={"body": "Уточнённый текст"})
+    )

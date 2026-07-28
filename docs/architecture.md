@@ -16,9 +16,15 @@
   задаются окружением.
 - `Publisher` изолирует Pyrofork и Pyromax. Dry-run реализует тот же интерфейс.
 - Timeout после возможной отправки получает `UNCERTAIN`, а не слепой retry: у userbot API
-  нет внешнего idempotency key.
+  нет внешнего idempotency key. Telegram сверяется по fingerprint; MAX остаётся
+  заблокированным до ручного решения, потому что Pyromax не читает историю.
 - Publication job захватывается атомарным conditional update; retry использует backoff,
-  а stale `SENDING` после рестарта требует reconciliation.
+  jitter и dead-letter, а stale `SENDING` после рестарта требует reconciliation.
+- PostgreSQL advisory lock и process-local fallback запрещают параллельные циклы.
+- `runtime_control` хранит kill switch платформ, `audit_logs` — административные
+  изменения. Состояние одинаково для API и отдельного worker-процесса.
+- Источник получает HEALTHY/DEGRADED/UNAVAILABLE по загрузке полных страниц; circuit
+  breaker изолирует постоянно падающий сайт.
 - Management API закрыт bearer-токеном. Source fetch принимает только публичный HTTPS,
   повторно валидирует redirect и ограничивает размер ответа.
 - Все даты UTC; локальное отображение использует `Europe/Saratov`.
@@ -30,8 +36,10 @@ RSS/HTML → discovery → article page → raw_articles → cleaned article rev
 → exact/context dedupe → event → claims/draft → validation → outbox → dry-run
 ```
 
-## Следующее усиление
+## Осознанные ограничения
 
 - embeddings и entity/action/location/time scorer для больших объёмов.
-- reconciliation `UNCERTAIN` через историю платформ.
-- production-метрики latency/error и alerting.
+- Автоматический reconciliation MAX появится после поддержки истории в Pyromax;
+  прямой HTTP в обход библиотеки запрещён.
+- Автопубликация остаётся выключенной до временных этапов из `ROADMAP.md`:
+  100–200 ручных проверок, 7 дней тестовых каналов и 14 дней стабильной работы.

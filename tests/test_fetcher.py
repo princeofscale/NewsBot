@@ -109,3 +109,60 @@ async def test_article_page_retries_404_with_trailing_slash() -> None:
 
     assert seen == ["/rss", "/item", "/item/"]
     assert len(result.articles) == 1
+
+
+@pytest.mark.asyncio
+async def test_discovery_respects_source_item_limit() -> None:
+    feed = "<rss><channel>" + "".join(
+        f"<item><title>Новость {item}</title><link>https://news.example/{item}</link></item>"
+        for item in range(4)
+    ) + "</channel></rss>"
+
+    fetcher = SourceFetcher(
+        Settings(
+            fetch_retries=1,
+            max_items_per_source=2,
+            validate_public_source_ips=False,
+        ),
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, text=feed))
+        ),
+    )
+    source = Source(
+        name="limited",
+        base_url="https://news.example",
+        kind=SourceKind.RSS,
+        feed_url="https://news.example/rss",
+    )
+
+    result = await fetcher.discover(source)
+
+    assert result.discovered_count == 2
+    assert [article.title for article in result.articles] == ["Новость 0", "Новость 1"]
+
+
+@pytest.mark.asyncio
+async def test_discovery_rejects_cross_domain_article_url() -> None:
+    feed = (
+        "<rss><channel><item><title>Чужая ссылка</title>"
+        "<link>https://attacker.example/item</link></item></channel></rss>"
+    )
+    fetcher = SourceFetcher(
+        Settings(fetch_retries=1, validate_public_source_ips=False),
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, text=feed))
+        ),
+    )
+    source = Source(
+        name="source",
+        base_url="https://news.example",
+        kind=SourceKind.RSS,
+        feed_url="https://news.example/rss",
+        origin_group="news.example",
+    )
+
+    result = await fetcher.fetch(source)
+
+    assert result.articles == []
+    assert result.article_errors == 1
+    assert result.error_reasons == ("cross-domain article URL",)

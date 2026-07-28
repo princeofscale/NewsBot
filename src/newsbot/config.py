@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -14,16 +15,23 @@ class Settings(BaseSettings):
     fetch_concurrency: int = Field(default=4, ge=1, le=20)
     fetch_timeout_seconds: float = Field(default=15, gt=0)
     fetch_retries: int = Field(default=3, ge=1, le=6)
+    max_items_per_source: int = Field(default=50, ge=1, le=500)
+    max_revision_recheck_age_hours: int = Field(default=24, ge=1, le=168)
+    domain_request_interval_seconds: float = Field(default=0.2, ge=0, le=10)
     max_response_bytes: int = Field(default=5_000_000, ge=10_000)
     validate_public_source_ips: bool = True
     circuit_failure_threshold: int = Field(default=5, ge=1)
     circuit_cooldown_seconds: int = Field(default=1800, ge=60)
     collecting_ttl_hours: int = Field(default=24, ge=1)
     max_article_age_hours: int = Field(default=72, ge=1)
+    article_processing_max_attempts: int = Field(default=5, ge=1, le=20)
+    article_retry_base_seconds: int = Field(default=60, ge=0)
     event_match_window_hours: int = Field(default=48, ge=1, le=168)
     publication_retry_base_seconds: int = Field(default=30, ge=1)
     sending_stale_seconds: int = Field(default=300, ge=30)
+    reconciliation_absence_delay_seconds: int = Field(default=300, ge=30)
     worker_interval_seconds: int = Field(default=300, ge=10)
+    cycle_timeout_seconds: int = Field(default=900, ge=30)
     management_token: str = ""
 
     llm_base_url: str = "https://cheapvibecode.ru/v1"
@@ -32,15 +40,23 @@ class Settings(BaseSettings):
     llm_retries: int = Field(default=2, ge=1, le=4)
     llm_retry_base_seconds: float = Field(default=0.5, ge=0, le=10)
     llm_timeout_seconds: float = Field(default=60, gt=0)
+    llm_input_usd_per_million: float = Field(default=0, ge=0)
+    llm_output_usd_per_million: float = Field(default=0, ge=0)
     publisher_timeout_seconds: float = Field(default=45, gt=0)
+    publisher_connect_timeout_seconds: float = Field(default=60, gt=0)
+    publication_min_interval_seconds: int = Field(default=30, ge=0, le=3600)
+    max_event_updates: int = Field(default=5, ge=0, le=20)
+    environment: Literal["development", "staging", "production"] = "development"
 
     telegram_api_id: int | None = None
     telegram_api_hash: str = ""
     telegram_session_string: str = ""
     telegram_chat_id: str = ""
+    telegram_test_chat_id: str = ""
     max_token: str = ""
     max_password: str = ""
     max_chat_id: int | None = None
+    max_test_chat_id: int | None = None
 
 
 @lru_cache

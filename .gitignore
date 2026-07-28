@@ -10,3 +10,5 @@ __pycache__/
 htmlcov/
 .coverage
 dry-run-review.json
+backups/
+*.dump

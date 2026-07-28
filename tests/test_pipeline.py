@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -21,7 +22,7 @@ from newsbot.db_models import (
 )
 from newsbot.fetcher import SourceFetcher
 from newsbot.llm import DeterministicLLM
-from newsbot.pipeline import Pipeline
+from newsbot.pipeline import CycleAlreadyRunning, CycleResult, Pipeline
 from newsbot.schemas import (
     CandidateArticle,
     ClaimPayload,
@@ -120,6 +121,81 @@ async def test_vertical_slice_clusters_and_is_idempotent(
         draft = await session.scalar(select(Draft))
         assert draft and draft.validated
         assert await session.scalar(select(func.count(PublicationJob.id))) == 2
+
+
+@pytest.mark.asyncio
+async def test_only_new_and_recent_article_urls_are_hydrated(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sessions.begin() as session:
+        source = Source(
+            name="source",
+            base_url="https://source.example",
+            kind=SourceKind.RSS,
+            feed_url="https://source.example/rss",
+        )
+        session.add(source)
+        await session.flush()
+        source_id = source.id
+    settings = Settings(max_revision_recheck_age_hours=24, validate_public_source_ips=False)
+    pipeline = Pipeline(
+        sessions,
+        SourceFetcher(settings, httpx.AsyncClient()),
+        DeterministicLLM(),
+        settings,
+    )
+    old = CandidateArticle(
+        url="https://source.example/old",
+        title="Старая",
+        text="Старая новость",
+        published_at=datetime(2020, 1, 1, tzinfo=UTC),
+        raw_content=b"old",
+        content_type="text/html",
+    )
+    recent = CandidateArticle(
+        url="https://source.example/recent",
+        title="Свежая",
+        text="Свежая новость",
+        published_at=datetime.now(UTC),
+        raw_content=b"recent",
+        content_type="text/html",
+    )
+    await pipeline._ingest(source_id, old)
+    await pipeline._ingest(source_id, recent)
+    new = recent.model_copy(update={"url": "https://source.example/new"})
+
+    selected = await pipeline._candidates_to_fetch(source_id, [old, recent, new])
+
+    assert [candidate.url for candidate in selected] == [recent.url, new.url]
+
+
+@pytest.mark.asyncio
+async def test_parallel_cycle_is_rejected_and_lock_is_released(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    settings = Settings(validate_public_source_ips=False)
+    pipeline = Pipeline(
+        sessions,
+        SourceFetcher(settings, httpx.AsyncClient()),
+        DeterministicLLM(),
+        settings,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking_cycle() -> CycleResult:
+        started.set()
+        await release.wait()
+        return CycleResult()
+
+    pipeline._run_cycle_unlocked = blocking_cycle  # type: ignore[method-assign]
+    first = asyncio.create_task(pipeline.run_cycle())
+    await started.wait()
+    with pytest.raises(CycleAlreadyRunning, match="cycle_already_running"):
+        await pipeline.run_cycle()
+    release.set()
+    await first
+    assert await pipeline.run_cycle() == CycleResult()
 
 
 @pytest.mark.asyncio
@@ -270,6 +346,56 @@ def test_conflicting_numbers_from_independent_claims_are_rejected() -> None:
     assert Pipeline._claims_conflict(claims)
 
 
+def test_claim_event_time_must_match_source_publication_time() -> None:
+    claim = ClaimPayload(
+        subject="Источник",
+        predicate="сообщил о событии",
+        claim="Источник сообщил о событии",
+        event_time=datetime(2026, 7, 29, 10, tzinfo=UTC),
+        source_article_id=uuid4(),
+    )
+
+    assert Pipeline._claim_supported(
+        claim,
+        "Источник сообщил о событии",
+        "Источник сообщил о событии",
+        datetime(2026, 7, 29, 11, tzinfo=UTC),
+    )
+    assert not Pipeline._claim_supported(
+        claim,
+        "Источник сообщил о событии",
+        "Источник сообщил о событии",
+        datetime(2026, 7, 31, 11, tzinfo=UTC),
+    )
+
+
+def test_post_grounding_rejects_invented_name_address_and_quote() -> None:
+    article_id = uuid4()
+    claims = [
+        ClaimPayload(
+            subject="Саратовводоканал",
+            predicate="отключит воду",
+            location=["улица Ленина, дом 12"],
+            claim="Саратовводоканал отключит воду на улице Ленина, дом 12",
+            source_article_id=article_id,
+        )
+    ]
+    post = Post(
+        title="Саратовводоканал отключит воду",
+        body=(
+            "Иван Петров сообщил: «авария устранена». "
+            "Работы пройдут на улице Московской, дом 14."
+        ),
+        source_urls=["https://official.example/news/1"],
+        event_id=uuid4(),
+        confidence=0.9,
+    )
+
+    assert not Pipeline._post_supported(
+        post, claims, ["https://official.example/news/1"]
+    )
+
+
 class FailsOnceLLM(DeterministicLLM):
     def __init__(self) -> None:
         self.failed = False
@@ -327,6 +453,7 @@ async def test_transient_llm_failure_resumes_existing_article(
     settings = Settings(
         database_url="sqlite+aiosqlite://",
         fetch_retries=1,
+        article_retry_base_seconds=0,
         validate_public_source_ips=False,
     )
     pipeline = Pipeline(

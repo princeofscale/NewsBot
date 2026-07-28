@@ -3,14 +3,16 @@ import hashlib
 import random
 import re
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from time import monotonic
+from typing import cast
 from urllib.parse import urlsplit
 from uuid import UUID
+from weakref import WeakKeyDictionary
 
 import structlog
-from sqlalchemy import func, or_, select, update
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy import func, or_, select, text, update
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from newsbot.config import Settings
 from newsbot.db_models import (
@@ -22,15 +24,26 @@ from newsbot.db_models import (
     PlatformPublication,
     PublicationJob,
     RawArticle,
+    RuntimeControl,
     Source,
     SourceFetch,
     as_utc,
     utcnow,
 )
-from newsbot.dedupe import event_similarity
+from newsbot.dedupe import event_similarity, extract_addresses, extract_entities
 from newsbot.fetcher import FetchResult, SourceFetcher
 from newsbot.formatters import format_max, format_telegram
-from newsbot.metrics import EVENTS, FETCHED, PROCESSED, STAGE_SECONDS
+from newsbot.metrics import (
+    EVENT_MERGES,
+    EVENTS,
+    FETCHED,
+    OUTBOX,
+    PROCESSED,
+    PUBLISH_ERRORS,
+    RISK_BLOCKED,
+    SOURCE_ERRORS,
+    STAGE_SECONDS,
+)
 from newsbot.parsing import text_hash
 from newsbot.schemas import (
     ArticleState,
@@ -42,12 +55,23 @@ from newsbot.schemas import (
     LLMPort,
     Platform,
     Post,
+    PublicationFinder,
     Publisher,
+    SourceHealth,
 )
+from newsbot.source_check import classify_source_health
 
 log = structlog.get_logger()
 RISK_TERMS = {
     "обвин",
+    "арест",
+    "авари",
+    "дтп",
+    "преступ",
+    "пропал",
+    "разыски",
+    "смерт",
+    "убий",
     "пострад",
     "погиб",
     "медицин",
@@ -55,6 +79,23 @@ RISK_TERMS = {
     "чрезвычайн",
     "персональн",
 }
+SENSITIVE_DATA_RE = re.compile(
+    r"(?:\b\d{3}-\d{3}-\d{3}\s?\d{2}\b|"
+    r"\b(?:паспорт|снилс)\s*[:№]?\s*[\d -]{6,}\b|"
+    r"\b(?:\+7|8)[\s()-]*\d{3}[\s()-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}\b|"
+    r"\b[\w.+-]+@[\w.-]+\.[a-zа-я]{2,}\b)",
+    re.IGNORECASE,
+)
+CLICKBAIT_TERMS = {"шок", "сенсаци", "вы не поверите", "срочно!!!"}
+CYCLE_LOCK_ID = 0x4E455753424F54
+_PROCESS_LOCKS: WeakKeyDictionary[AsyncEngine, asyncio.Lock] = WeakKeyDictionary()
+_PLATFORM_LOCKS: WeakKeyDictionary[AsyncEngine, dict[Platform, asyncio.Lock]] = (
+    WeakKeyDictionary()
+)
+
+
+class CycleAlreadyRunning(RuntimeError):
+    pass
 
 
 @dataclass(slots=True)
@@ -79,9 +120,41 @@ class Pipeline:
         self.llm = llm
         self.settings = settings
 
+    async def close(self) -> None:
+        await self.fetcher.close()
+        close = getattr(self.llm, "close", None)
+        if close:
+            await close()
+
     async def run_cycle(self) -> CycleResult:
+        engine = cast(AsyncEngine, self.sessions.kw["bind"])
+        process_lock = _PROCESS_LOCKS.setdefault(engine, asyncio.Lock())
+        if process_lock.locked():
+            raise CycleAlreadyRunning("cycle_already_running")
+        async with process_lock, asyncio.timeout(self.settings.cycle_timeout_seconds):
+            if engine.dialect.name != "postgresql":
+                return await self._run_cycle_unlocked()
+            async with engine.connect() as connection:
+                acquired = await connection.scalar(
+                    text("SELECT pg_try_advisory_lock(:lock_id)"),
+                    {"lock_id": CYCLE_LOCK_ID},
+                )
+                if not acquired:
+                    raise CycleAlreadyRunning("cycle_already_running")
+                try:
+                    return await self._run_cycle_unlocked()
+                finally:
+                    await asyncio.shield(
+                        connection.execute(
+                            text("SELECT pg_advisory_unlock(:lock_id)"),
+                            {"lock_id": CYCLE_LOCK_ID},
+                        )
+                    )
+
+    async def _run_cycle_unlocked(self) -> CycleResult:
         started = monotonic()
         result = CycleResult()
+        await self._resume_pending_articles(result)
         async with self.sessions() as session:
             sources = list(
                 (
@@ -99,10 +172,16 @@ class Pipeline:
             <= now
             if not source.disabled_until or as_utc(source.disabled_until) <= now
         ]
-        fetched = await asyncio.gather(
-            *(self.fetcher.fetch(source) for source in due), return_exceptions=True
+        discovered = await asyncio.gather(
+            *(self.fetcher.discover(source) for source in due), return_exceptions=True
         )
-        for source, outcome in zip(due, fetched, strict=True):
+        outcomes = await asyncio.gather(
+            *(
+                self._hydrate_discovery(source, discovery)
+                for source, discovery in zip(due, discovered, strict=True)
+            )
+        )
+        for source, outcome in zip(due, outcomes, strict=True):
             if isinstance(outcome, BaseException):
                 result.errors += 1
                 await self._record_failure(source.id, outcome)
@@ -123,12 +202,128 @@ class Pipeline:
         await self.expire_old_events()
         return result
 
+    async def _hydrate_discovery(
+        self, source: Source, discovery: FetchResult | BaseException
+    ) -> FetchResult | BaseException:
+        if isinstance(discovery, BaseException):
+            return discovery
+        try:
+            candidates = await self._candidates_to_fetch(source.id, discovery.articles)
+            hydrated = await self.fetcher.hydrate(source, candidates)
+        except Exception as error:
+            return error
+        return FetchResult(
+            articles=hydrated.articles,
+            status_code=discovery.status_code,
+            etag=discovery.etag,
+            last_modified=discovery.last_modified,
+            article_errors=discovery.article_errors + hydrated.article_errors,
+            discovered_count=discovery.discovered_count,
+            attempted_count=hydrated.attempted_count,
+            error_reasons=discovery.error_reasons + hydrated.error_reasons,
+        )
+
+    async def _resume_pending_articles(self, result: CycleResult) -> None:
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(Article, EventArticle.event_id)
+                    .join(EventArticle, EventArticle.article_id == Article.id)
+                    .where(
+                        or_(
+                            Article.processing_state == ArticleState.NEW,
+                            (
+                                (Article.processing_state == ArticleState.FAILED)
+                                & or_(
+                                    Article.next_processing_at.is_(None),
+                                    Article.next_processing_at <= utcnow(),
+                                )
+                            ),
+                        ),
+                        Article.processing_attempts
+                        < self.settings.article_processing_max_attempts,
+                    )
+                    .order_by(Article.created_at)
+                    .limit(100)
+                )
+            ).all()
+        for article, event_id in rows:
+            try:
+                result.drafts_created += await self._finish_article(
+                    article.id, event_id, article.title, article.text
+                )
+            except Exception:
+                result.errors += 1
+                await self._mark_article_failure(article.id, event_id)
+                continue
+            async with self.sessions.begin() as session:
+                stored = await session.get(Article, article.id)
+                if stored:
+                    stored.processing_state = ArticleState.PROCESSED
+                    stored.next_processing_at = None
+
+    async def _mark_article_failure(self, article_id: UUID, event_id: UUID) -> None:
+        async with self.sessions.begin() as session:
+            article = await session.get(Article, article_id)
+            if not article:
+                return
+            article.processing_attempts += 1
+            if article.processing_attempts >= self.settings.article_processing_max_attempts:
+                article.processing_state = ArticleState.PROCESSED
+                article.rejected_reason = "article processing retry limit reached"
+                event = await session.get(Event, event_id)
+                if event:
+                    event.state = EventState.COLLECTING
+                    event.requires_manual_review = True
+                    event.decision_reason = article.rejected_reason
+                return
+            article.processing_state = ArticleState.FAILED
+            delay = self.settings.article_retry_base_seconds * 2 ** (
+                article.processing_attempts - 1
+            )
+            article.next_processing_at = utcnow() + timedelta(
+                seconds=delay + random.uniform(0, delay * 0.2)
+            )
+
+    async def _candidates_to_fetch(
+        self, source_id: UUID, candidates: list[CandidateArticle]
+    ) -> list[CandidateArticle]:
+        if not candidates:
+            return []
+        cutoff = utcnow() - timedelta(hours=self.settings.max_revision_recheck_age_hours)
+        urls = [candidate.url for candidate in candidates]
+        async with self.sessions() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        Article.canonical_url,
+                        func.max(Article.published_at),
+                        func.max(Article.created_at),
+                    )
+                    .where(Article.source_id == source_id, Article.canonical_url.in_(urls))
+                    .group_by(Article.canonical_url)
+                )
+            ).all()
+        known = {
+            url: as_utc(published_at or created_at)
+            for url, published_at, created_at in rows
+            if published_at or created_at
+        }
+        return [
+            candidate
+            for candidate in candidates
+            if candidate.url not in known or known[candidate.url] >= cutoff
+        ]
+
     async def _record_failure(self, source_id: UUID, error: BaseException) -> None:
         async with self.sessions.begin() as session:
             source = await session.get(Source, source_id)
             if not source:
                 return
             self.fetcher.apply_failure(source)
+            source.last_checked_at = utcnow()
+            source.last_error = type(error).__name__
+            source.health_state = SourceHealth.UNAVAILABLE
             session.add(
                 SourceFetch(
                     source_id=source_id,
@@ -139,6 +334,7 @@ class Pipeline:
         await log.awarning(
             "source_fetch_failed", source_id=str(source_id), error=type(error).__name__
         )
+        SOURCE_ERRORS.labels(source=str(source_id), stage="fetch").inc()
 
     async def _record_success(
         self, source_id: UUID, outcome: FetchResult, result: CycleResult
@@ -148,7 +344,14 @@ class Pipeline:
                 source_id=source_id,
                 finished_at=utcnow(),
                 status_code=outcome.status_code,
-                item_count=len(outcome.articles),
+                item_count=outcome.discovered_count,
+                loaded_count=len(outcome.articles),
+                extraction_success_rate=(
+                    len(outcome.articles) / outcome.discovered_count
+                    if outcome.discovered_count
+                    else 1
+                ),
+                diagnostics=list(outcome.error_reasons),
                 error=(
                     f"{outcome.article_errors} article page(s) failed"
                     if outcome.article_errors
@@ -188,12 +391,39 @@ class Pipeline:
                         ],
                     )
                 )
-            if source and not failures:
+            if source:
                 source.etag = outcome.etag
                 source.last_modified = outcome.last_modified
                 source.last_fetched_at = utcnow()
-                source.consecutive_failures = 0
-                source.disabled_until = None
+                source.last_checked_at = utcnow()
+                total_failures = failures + outcome.article_errors
+                health = (
+                    SourceHealth.HEALTHY
+                    if outcome.status_code == 304 or not outcome.attempted_count
+                    else classify_source_health(
+                        outcome.attempted_count,
+                        len(outcome.articles),
+                        total_failures,
+                        sum(bool(article.title) for article in outcome.articles),
+                        sum(article.published_at is not None for article in outcome.articles),
+                        sum(bool(article.text) for article in outcome.articles),
+                    )
+                )
+                source.health_state = health
+                if health != SourceHealth.HEALTHY:
+                    source.last_error = (
+                        stored_fetch.error
+                        if stored_fetch and stored_fetch.error
+                        else f"source health {health}"
+                    )
+                    self.fetcher.apply_failure(source)
+                else:
+                    source.health_state = SourceHealth.HEALTHY
+                    if outcome.articles:
+                        source.last_success_at = utcnow()
+                    source.last_error = None
+                    source.consecutive_failures = 0
+                    source.disabled_until = None
 
     async def _ingest(self, source_id: UUID, candidate: CandidateArticle) -> tuple[int, int, int]:
         content_hash = text_hash(candidate.text)
@@ -263,10 +493,7 @@ class Pipeline:
                     ),
                 )
             except Exception:
-                async with self.sessions.begin() as session:
-                    stored = await session.get(Article, existing_id)
-                    if stored:
-                        stored.processing_state = ArticleState.FAILED
+                await self._mark_article_failure(existing_id, event_id)
                 raise
         if existing:
             return 0, 0, 0
@@ -333,6 +560,9 @@ class Pipeline:
                 await session.flush()
                 event_created = 1
                 EVENTS.inc()
+            else:
+                event.manually_approved = False
+                EVENT_MERGES.inc()
             event_id = event.id
             session.add(
                 EventArticle(event_id=event_id, article_id=article_id, similarity=similarity)
@@ -343,10 +573,7 @@ class Pipeline:
                 article_id, event_id, candidate.title, candidate.text
             )
         except Exception:
-            async with self.sessions.begin() as session:
-                failed_article = await session.get(Article, article_id)
-                if failed_article:
-                    failed_article.processing_state = ArticleState.FAILED
+            await self._mark_article_failure(article_id, event_id)
             raise
         return 1, event_created, draft_created
 
@@ -365,12 +592,18 @@ class Pipeline:
             else await self.llm.extract_claims(article_id, title, text)
         )
         async with self.sessions.begin() as session:
-            event = await session.get(Event, event_id)
+            event = await session.get(Event, event_id, with_for_update=True)
             if not event:
                 return 0
             if not existing_claims:
                 for item in extracted:
-                    supported = self._claim_supported(item, title, text)
+                    article = await session.get(Article, article_id)
+                    supported = self._claim_supported(
+                        item,
+                        title,
+                        text,
+                        article.published_at if article else None,
+                    )
                     session.add(
                         Claim(
                             event_id=event_id,
@@ -409,6 +642,9 @@ class Pipeline:
         valid = (
             len(format_telegram(post)) <= 4000
             and len(format_max(post)) <= 4000
+            and len(post.title) <= 120
+            and not post.title.rstrip().endswith((".", "!", "?"))
+            and not any(term in post.title.casefold() for term in CLICKBAIT_TERMS)
             and self._post_supported(post, claims, urls)
             and await self.llm.verify_post(post, claims)
         )
@@ -428,6 +664,12 @@ class Pipeline:
                 post.body,
                 post.source_urls,
             ):
+                article.processing_state = ArticleState.PROCESSED
+                return 0
+            if latest and latest.version >= self.settings.max_event_updates + 1:
+                event.state = EventState.COLLECTING
+                event.requires_manual_review = True
+                event.decision_reason = "automatic event update limit reached"
                 article.processing_state = ArticleState.PROCESSED
                 return 0
             draft = Draft(
@@ -462,15 +704,21 @@ class Pipeline:
             )
             if not valid:
                 event.state = EventState.COLLECTING
+                event.requires_manual_review = True
+                event.decision_reason = "LLM draft failed deterministic grounding"
                 article.processing_state = ArticleState.PROCESSED
                 return 1
-            has_publications = bool(
-                await session.scalar(
-                    select(PlatformPublication.id)
-                    .where(PlatformPublication.event_id == event_id)
-                    .limit(1)
-                )
+            published_platforms = set(
+                (
+                    await session.scalars(
+                        select(PlatformPublication.platform).where(
+                            PlatformPublication.event_id == event_id,
+                            PlatformPublication.deleted_at.is_(None),
+                        )
+                    )
+                ).all()
             )
+            has_publications = bool(published_platforms)
             event.state = EventState.PUBLISHED if has_publications else EventState.READY
             session.add_all(
                 [
@@ -479,7 +727,8 @@ class Pipeline:
                         platform=platform,
                         operation=(
                             JobOperation.EDIT
-                            if has_publications and platform == Platform.TELEGRAM
+                            if platform == Platform.TELEGRAM
+                            and Platform.TELEGRAM in published_platforms
                             else JobOperation.PUBLISH
                         ),
                     )
@@ -530,20 +779,30 @@ class Pipeline:
         return best
 
     @staticmethod
-    def _claim_supported(claim: ClaimPayload, title: str, source_text: str) -> bool:
+    def _claim_supported(
+        claim: ClaimPayload,
+        title: str,
+        source_text: str,
+        published_at: datetime | None = None,
+    ) -> bool:
         corpus = f"{title} {source_text}".casefold()
         values = claim.numbers + claim.names + claim.location
         claim_tokens = set(re.findall(r"\w{3,}", f"{claim.predicate} {claim.claim}".casefold()))
+        time_supported = not claim.event_time or (
+            published_at is not None
+            and abs(as_utc(claim.event_time) - as_utc(published_at)) <= timedelta(hours=24)
+        )
         covered = sum(token in corpus for token in claim_tokens)
         return (
             bool(claim_tokens)
             and covered / len(claim_tokens) >= 0.65
             and all(value.casefold() in corpus for value in values)
+            and time_supported
         )
 
     @staticmethod
     def _post_supported(post: Post, claims: list[ClaimPayload], source_urls: list[str]) -> bool:
-        corpus = " ".join(
+        corpus_text = " ".join(
             " ".join(
                 [
                     claim.subject,
@@ -555,14 +814,22 @@ class Pipeline:
                 ]
             )
             for claim in claims
-        ).casefold()
+        )
+        corpus = corpus_text.casefold()
         tokens = set(re.findall(r"\w{3,}", f"{post.title} {post.body}".casefold()))
         numbers = re.findall(r"\b\d+(?:[.,]\d+)?\b", f"{post.title} {post.body}")
+        post_text = f"{post.title} {post.body}"
+        entities = extract_entities(post_text)
+        addresses = extract_addresses(post_text)
+        quotes = re.findall(r"[«\"]([^»\"]{3,})[»\"]", post_text)
         return (
             post.source_urls == source_urls[:3]
             and bool(tokens)
             and sum(token in corpus for token in tokens) / len(tokens) >= 0.65
             and all(number in corpus for number in numbers)
+            and all(entity in corpus for entity in entities)
+            and all(address in extract_addresses(corpus_text) for address in addresses)
+            and all(quote.casefold() in corpus for quote in quotes)
         )
 
     async def _prepare_draft(
@@ -593,6 +860,7 @@ class Pipeline:
         if unverified:
             event.state = EventState.COLLECTING
             event.decision_reason = "important claim values are not present in source text"
+            event.requires_manual_review = True
             return None
         verified_article_ids = set(
             (
@@ -624,9 +892,20 @@ class Pipeline:
             for article, _ in rows
             for term in RISK_TERMS
         )
-        if risky and not (official and len(reliable) >= 2):
+        sensitive = any(
+            SENSITIVE_DATA_RE.search(f"{article.title} {article.text}") for article, _ in rows
+        )
+        if sensitive:
+            event.state = EventState.COLLECTING
+            event.decision_reason = "sensitive personal data requires manual review"
+            event.requires_manual_review = True
+            RISK_BLOCKED.inc()
+            return None
+        if risky and not event.manually_approved and not (official and len(reliable) >= 2):
             event.state = EventState.COLLECTING
             event.decision_reason = "risk topic requires official and independent confirmation"
+            event.requires_manual_review = True
+            RISK_BLOCKED.inc()
             return None
         if official:
             event.confidence = max(source.trust_level for source in sources.values())
@@ -651,7 +930,9 @@ class Pipeline:
         if self._claims_conflict(claims):
             event.state = EventState.COLLECTING
             event.decision_reason = "independent source claims conflict"
+            event.requires_manual_review = True
             return None
+        event.requires_manual_review = False
         urls = [article.canonical_url for article, _ in rows]
         return claims, urls, event.confidence
 
@@ -698,6 +979,19 @@ class Pipeline:
                 )
             )
 
+    async def reprocess_event(self, event_id: UUID) -> int:
+        async with self.sessions() as session:
+            article = await session.scalar(
+                select(Article)
+                .join(EventArticle, EventArticle.article_id == Article.id)
+                .where(EventArticle.event_id == event_id)
+                .order_by(Article.created_at.desc())
+                .limit(1)
+            )
+        if not article:
+            raise ValueError("event has no articles")
+        return await self._finish_article(article.id, event_id, article.title, article.text)
+
 
 def _post_from_draft(draft: Draft) -> Post:
     return Post.model_validate(draft, from_attributes=True)
@@ -713,6 +1007,8 @@ class PublicationWorker:
         retry_base_seconds: int = 30,
         sending_stale_seconds: int = 300,
         publish_timeout_seconds: float = 45,
+        publication_min_interval_seconds: int = 0,
+        reconciliation_absence_delay_seconds: int = 300,
     ) -> None:
         self.sessions = sessions
         self.publishers = publishers
@@ -721,9 +1017,23 @@ class PublicationWorker:
         self.retry_base_seconds = retry_base_seconds
         self.sending_stale_seconds = sending_stale_seconds
         self.publish_timeout_seconds = publish_timeout_seconds
+        self.publication_min_interval_seconds = publication_min_interval_seconds
+        self.reconciliation_absence_delay_seconds = reconciliation_absence_delay_seconds
 
     async def run_once(self) -> int:
         now = utcnow()
+        async with self.sessions() as session:
+            control = await session.get(RuntimeControl, 1)
+            if control and not control.publication_enabled:
+                return 0
+            enabled_platforms = [
+                platform
+                for platform, enabled in (
+                    (Platform.TELEGRAM, not control or control.telegram_enabled),
+                    (Platform.MAX, not control or control.max_enabled),
+                )
+                if enabled
+            ]
         async with self.sessions.begin() as session:
             await session.execute(
                 update(PublicationJob)
@@ -737,12 +1047,25 @@ class PublicationWorker:
                 )
             )
         async with self.sessions() as session:
+            outbox_counts: dict[JobState, int] = {
+                state: count
+                for state, count in (
+                    await session.execute(
+                        select(PublicationJob.state, func.count(PublicationJob.id)).group_by(
+                            PublicationJob.state
+                        )
+                    )
+                ).all()
+            }
+            for state in JobState:
+                OUTBOX.labels(state=state.value).set(outbox_counts.get(state, 0))
             job_ids = list(
                 (
                     await session.scalars(
                         select(PublicationJob.id)
                         .where(
                             PublicationJob.state.in_([JobState.PENDING, JobState.RETRY]),
+                            PublicationJob.platform.in_(enabled_platforms),
                             or_(
                                 PublicationJob.next_attempt_at.is_(None),
                                 PublicationJob.next_attempt_at <= now,
@@ -757,8 +1080,162 @@ class PublicationWorker:
             await self._publish(job_id)
         return len(job_ids)
 
-    async def _publish(self, job_id: UUID) -> None:
+    async def reconcile_uncertain(self) -> dict[str, int]:
+        counts = {"published": 0, "retry": 0, "unsupported": 0, "deferred": 0}
+        async with self.sessions() as session:
+            job_ids = list(
+                (
+                    await session.scalars(
+                        select(PublicationJob.id)
+                        .where(PublicationJob.state == JobState.UNCERTAIN)
+                        .order_by(PublicationJob.created_at)
+                        .limit(self.batch_size)
+                    )
+                ).all()
+            )
+        for job_id in job_ids:
+            async with self.sessions() as session:
+                job = await session.get(PublicationJob, job_id)
+                draft = await session.get(Draft, job.draft_id) if job else None
+            if not job or not draft:
+                continue
+            if as_utc(job.updated_at) > utcnow() - timedelta(
+                seconds=self.reconciliation_absence_delay_seconds
+            ):
+                counts["deferred"] += 1
+                continue
+            publisher = self.publishers.get(job.platform)
+            if not isinstance(publisher, PublicationFinder):
+                counts["unsupported"] += 1
+                continue
+            try:
+                async with asyncio.timeout(self.publish_timeout_seconds):
+                    external_id = await publisher.find_publication(_post_from_draft(draft))
+            except Exception:
+                counts["deferred"] += 1
+                continue
+            if external_id:
+                await self.resolve_published(job_id, external_id)
+                counts["published"] += 1
+            else:
+                await self.resolve_retry(job_id)
+                counts["retry"] += 1
+        return counts
+
+    async def resolve_published(self, job_id: UUID, external_id: str) -> None:
         async with self.sessions.begin() as session:
+            job = await session.get(PublicationJob, job_id)
+            if not job or job.state != JobState.UNCERTAIN:
+                raise ValueError("job is not UNCERTAIN")
+            draft = await session.get(Draft, job.draft_id)
+            if not draft:
+                raise ValueError("draft not found")
+            publication = await session.scalar(
+                select(PlatformPublication).where(PlatformPublication.job_id == job.id)
+            )
+            if job.operation == JobOperation.EDIT:
+                publication = await session.scalar(
+                    select(PlatformPublication)
+                    .where(
+                        PlatformPublication.event_id == draft.event_id,
+                        PlatformPublication.platform == job.platform,
+                        PlatformPublication.deleted_at.is_(None),
+                    )
+                    .order_by(PlatformPublication.published_at.desc())
+                    .limit(1)
+                )
+                if not publication:
+                    raise ValueError("existing publication not found")
+                publication.updated_at = utcnow()
+            elif not publication:
+                session.add(
+                    PlatformPublication(
+                        job_id=job.id,
+                        event_id=draft.event_id,
+                        platform=job.platform,
+                        external_id=external_id,
+                        published_at=utcnow(),
+                        metadata_json={"reconciled": True},
+                    )
+                )
+            job.state = JobState.PUBLISHED
+            job.next_attempt_at = None
+            job.last_error = None
+            remaining = await session.scalar(
+                select(func.count(PublicationJob.id)).where(
+                    PublicationJob.draft_id == draft.id,
+                    PublicationJob.id != job.id,
+                    PublicationJob.state != JobState.PUBLISHED,
+                )
+            )
+            if not remaining:
+                event = await session.get(Event, draft.event_id)
+                if event:
+                    event.state = (
+                        EventState.UPDATED
+                        if job.operation == JobOperation.EDIT
+                        else EventState.PUBLISHED
+                    )
+
+    async def resolve_retry(self, job_id: UUID) -> None:
+        async with self.sessions.begin() as session:
+            job = await session.get(PublicationJob, job_id)
+            if not job or job.state != JobState.UNCERTAIN:
+                raise ValueError("job is not UNCERTAIN")
+            job.state = JobState.RETRY
+            job.next_attempt_at = utcnow()
+            job.last_error = "reconciliation found no matching publication"
+
+    async def _publish(self, job_id: UUID) -> None:
+        async with self.sessions() as session:
+            platform = await session.scalar(
+                select(PublicationJob.platform).where(PublicationJob.id == job_id)
+            )
+        if not platform:
+            return
+        engine = cast(AsyncEngine, self.sessions.kw["bind"])
+        platform_enum = Platform(platform)
+        lock = _PLATFORM_LOCKS.setdefault(engine, {}).setdefault(
+            platform_enum, asyncio.Lock()
+        )
+        async with lock:
+            if engine.dialect.name != "postgresql":
+                await self._publish_locked(job_id)
+                return
+            lock_id = CYCLE_LOCK_ID + 1 + list(Platform).index(platform_enum)
+            async with engine.connect() as connection:
+                acquired = await connection.scalar(
+                    text("SELECT pg_try_advisory_lock(:lock_id)"),
+                    {"lock_id": lock_id},
+                )
+                if not acquired:
+                    return
+                try:
+                    await self._publish_locked(job_id)
+                finally:
+                    await asyncio.shield(
+                        connection.execute(
+                            text("SELECT pg_advisory_unlock(:lock_id)"),
+                            {"lock_id": lock_id},
+                        )
+                    )
+
+    async def _publish_locked(self, job_id: UUID) -> None:
+        async with self.sessions.begin() as session:
+            pending_job = await session.get(PublicationJob, job_id)
+            control = await session.get(RuntimeControl, 1)
+            if not pending_job or (
+                control
+                and (
+                    not control.publication_enabled
+                    or (
+                        pending_job.platform == Platform.TELEGRAM
+                        and not control.telegram_enabled
+                    )
+                    or (pending_job.platform == Platform.MAX and not control.max_enabled)
+                )
+            ):
+                return
             claimed = await session.scalar(
                 update(PublicationJob)
                 .where(
@@ -790,6 +1267,7 @@ class PublicationWorker:
                 .where(
                     PlatformPublication.event_id == draft.event_id,
                     PlatformPublication.platform == platform,
+                    PlatformPublication.deleted_at.is_(None),
                 )
                 .order_by(PlatformPublication.published_at.desc())
                 .limit(1)
@@ -798,23 +1276,39 @@ class PublicationWorker:
                 job.state = JobState.FAILED
                 job.last_error = "no existing platform publication to edit"
                 return
+            latest_publication_at = await session.scalar(
+                select(func.max(PlatformPublication.published_at)).where(
+                    PlatformPublication.platform == platform
+                )
+            )
+            if (
+                operation == JobOperation.PUBLISH
+                and latest_publication_at
+                and as_utc(latest_publication_at)
+                + timedelta(seconds=self.publication_min_interval_seconds)
+                > utcnow()
+            ):
+                job.state = JobState.RETRY
+                job.next_attempt_at = as_utc(latest_publication_at) + timedelta(
+                    seconds=self.publication_min_interval_seconds
+                )
+                job.attempts -= 1
+                return
 
         try:
-            if operation == JobOperation.EDIT:
-                assert publication is not None
-                await asyncio.wait_for(
-                    self.publishers[platform].edit(publication.external_id, post),
-                    timeout=self.publish_timeout_seconds,
-                )
-                result = None
-            else:
-                if platform == Platform.MAX and publication:
-                    post = post.model_copy(update={"title": f"Обновление: {post.title}"[:240]})
-                result = await asyncio.wait_for(
-                    self.publishers[platform].publish(post),
-                    timeout=self.publish_timeout_seconds,
-                )
+            async with asyncio.timeout(self.publish_timeout_seconds):
+                if operation == JobOperation.EDIT:
+                    assert publication is not None
+                    await self.publishers[platform].edit(publication.external_id, post)
+                    result = None
+                else:
+                    if platform == Platform.MAX and publication:
+                        post = post.model_copy(
+                            update={"title": f"Обновление: {post.title}"[:240]}
+                        )
+                    result = await self.publishers[platform].publish(post)
         except TimeoutError:
+            PUBLISH_ERRORS.labels(platform=str(platform), kind="timeout").inc()
             async with self.sessions.begin() as session:
                 job = await session.get(PublicationJob, job_id)
                 if job:
@@ -822,14 +1316,34 @@ class PublicationWorker:
                     job.last_error = "timeout after send; reconciliation required"
             return
         except Exception as error:
+            error_name = type(error).__name__.casefold()
+            permanent = isinstance(
+                error, (ValueError, PermissionError, NotImplementedError)
+            ) or any(
+                term in error_name
+                for term in ("unauthorized", "forbidden", "authkey", "sessionrevoked")
+            )
+            PUBLISH_ERRORS.labels(
+                platform=str(platform),
+                kind="permanent" if permanent else "transient",
+            ).inc()
             async with self.sessions.begin() as session:
                 job = await session.get(PublicationJob, job_id)
                 if job:
                     job.state = (
-                        JobState.RETRY if job.attempts < self.max_attempts else JobState.FAILED
+                        JobState.FAILED
+                        if permanent
+                        else JobState.RETRY
+                        if job.attempts < self.max_attempts
+                        else JobState.DEAD_LETTER
                     )
                     if job.state == JobState.RETRY:
                         delay = self.retry_base_seconds * 2 ** (job.attempts - 1)
+                        retry_after = getattr(error, "retry_after", None) or getattr(
+                            error, "value", None
+                        )
+                        if isinstance(retry_after, (int, float)):
+                            delay = max(delay, retry_after)
                         job.next_attempt_at = utcnow() + timedelta(
                             seconds=delay + random.uniform(0, delay * 0.2)
                         )
@@ -848,6 +1362,7 @@ class PublicationWorker:
                     select(PlatformPublication).where(
                         PlatformPublication.event_id == draft.event_id,
                         PlatformPublication.platform == platform,
+                        PlatformPublication.deleted_at.is_(None),
                     )
                 )
                 if stored_publication:

@@ -2,6 +2,7 @@ import asyncio
 import json
 import random
 import re
+from time import monotonic
 from typing import Any, TypeVar, cast
 from uuid import UUID
 
@@ -12,12 +13,13 @@ from openai import (
     InternalServerError,
     RateLimitError,
 )
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from newsbot.config import Settings
-from newsbot.schemas import ClaimPayload, Post
+from newsbot.metrics import LLM_REQUESTS, LLM_TOKENS, STAGE_SECONDS
+from newsbot.schemas import ClaimPayload, Post, StrictModel
 
-SchemaT = TypeVar("SchemaT", bound=BaseModel)
+SchemaT = TypeVar("SchemaT", bound=StrictModel)
 NUMBER_RE = re.compile(r"\b\d+(?:[.,]\d+)?\b")
 
 
@@ -32,11 +34,11 @@ def _message_content(response: object) -> str:
     return str(completion.choices[0].message.content or "")
 
 
-class ClaimsResponse(BaseModel):
+class ClaimsResponse(StrictModel):
     claims: list[ClaimPayload]
 
 
-class VerificationResponse(BaseModel):
+class VerificationResponse(StrictModel):
     valid: bool
     unsupported: list[str] = Field(default_factory=list)
 
@@ -50,12 +52,16 @@ class OpenAICompatibleLLM:
             timeout=settings.llm_timeout_seconds,
         )
 
+    async def close(self) -> None:
+        await self.client.close()
+
     async def _json(
         self, system: str, payload: dict[str, object], schema: type[SchemaT]
     ) -> SchemaT:
         error: Exception | None = None
         request_payload = {**payload, "json_schema": schema.model_json_schema()}
         for attempt in range(self.settings.llm_retries):
+            started = monotonic()
             try:
                 response = await self.client.chat.completions.create(
                     model=self.settings.llm_model,
@@ -72,7 +78,16 @@ class OpenAICompatibleLLM:
                 content = _message_content(response)
                 if not content.strip():
                     raise ValueError("LLM returned an empty response")
-                return schema.model_validate_json(content)
+                result = schema.model_validate_json(content)
+                usage = getattr(response, "usage", None)
+                LLM_TOKENS.labels(direction="input").inc(
+                    getattr(usage, "prompt_tokens", 0) or 0
+                )
+                LLM_TOKENS.labels(direction="output").inc(
+                    getattr(usage, "completion_tokens", 0) or 0
+                )
+                LLM_REQUESTS.labels(result="success").inc()
+                return result
             except (
                 ValueError,
                 TypeError,
@@ -85,10 +100,13 @@ class OpenAICompatibleLLM:
                 RateLimitError,
                 InternalServerError,
             ) as exc:
+                LLM_REQUESTS.labels(result="error").inc()
                 error = exc
                 if attempt + 1 < self.settings.llm_retries:
                     base = self.settings.llm_retry_base_seconds * 2**attempt
                     await asyncio.sleep(base + random.uniform(0, base * 0.2))
+            finally:
+                STAGE_SECONDS.labels(stage="llm").observe(monotonic() - started)
         raise ValueError(f"LLM returned invalid structured response: {error}")
 
     async def extract_claims(self, article_id: UUID, title: str, text: str) -> list[ClaimPayload]:
