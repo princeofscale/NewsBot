@@ -22,7 +22,14 @@ from newsbot.db_models import (
 from newsbot.fetcher import SourceFetcher
 from newsbot.llm import DeterministicLLM
 from newsbot.pipeline import Pipeline
-from newsbot.schemas import CandidateArticle, ClaimPayload, EventState, Post, SourceKind
+from newsbot.schemas import (
+    CandidateArticle,
+    ClaimPayload,
+    EventState,
+    JobState,
+    Post,
+    SourceKind,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -166,6 +173,17 @@ async def test_changed_content_at_same_url_creates_revision_and_rechecks_event(
         assert articles[1].revision_of_id == articles[0].id
         assert await session.scalar(select(func.count(Event.id))) == 1
         assert await session.scalar(select(func.count(EventArticle.article_id))) == 2
+        jobs = list(
+            (
+                await session.scalars(select(PublicationJob).order_by(PublicationJob.created_at))
+            ).all()
+        )
+        assert [job.state for job in jobs] == [
+            JobState.CANCELLED,
+            JobState.CANCELLED,
+            JobState.PENDING,
+            JobState.PENDING,
+        ]
 
 
 @pytest.mark.asyncio

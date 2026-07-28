@@ -25,6 +25,7 @@ class JobState(StrEnum):
     SENDING = "SENDING"
     RETRY = "RETRY"
     PUBLISHED = "PUBLISHED"
+    CANCELLED = "CANCELLED"
     FAILED = "FAILED"
     UNCERTAIN = "UNCERTAIN"
 

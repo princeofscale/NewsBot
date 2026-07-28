@@ -444,6 +444,22 @@ class Pipeline:
             )
             session.add(draft)
             await session.flush()
+            await session.execute(
+                update(PublicationJob)
+                .where(
+                    PublicationJob.draft_id.in_(
+                        select(Draft.id).where(
+                            Draft.event_id == event_id,
+                            Draft.id != draft.id,
+                        )
+                    ),
+                    PublicationJob.state.in_([JobState.PENDING, JobState.RETRY]),
+                )
+                .values(
+                    state=JobState.CANCELLED,
+                    last_error="superseded by a newer draft",
+                )
+            )
             if not valid:
                 event.state = EventState.COLLECTING
                 article.processing_state = ArticleState.PROCESSED
