@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Источник А</title>
+    <item>
+      <title>В Саратове открыли новый участок набережной</title>
+      <link>https://a.example/news/embankment?utm_source=rss</link>
+      <pubDate>Tue, 28 Jul 2026 08:00:00 GMT</pubDate>
+      <description><![CDATA[В Саратове 28 июля открыли новый участок набережной длиной 500 метров.]]></description>
+    </item>
+  </channel>
+</rss>

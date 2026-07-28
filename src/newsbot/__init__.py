@@ -1,0 +1,1 @@
+"""Saratov autonomous news aggregator."""
